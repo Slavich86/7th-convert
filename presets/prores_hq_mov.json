@@ -1,0 +1,27 @@
+{
+  "id": "prores_hq_mov",
+  "name": "ProRes 422 HQ MOV",
+  "group": "ProRes",
+  "output": {
+    "container": "mov",
+    "extension": "mov"
+  },
+  "video": {
+    "enabled": true,
+    "codec": "prores_ks",
+    "profile": "hq",
+    "pix_fmt": "yuv422p10le"
+  },
+  "audio": {
+    "enabled": true,
+    "codec": "pcm_s24le",
+    "sample_rate": 48000,
+    "channels": "source"
+  },
+  "filters": {
+    "scale": "keep",
+    "fps": "source",
+    "force_even_dimensions": false
+  }
+}
+

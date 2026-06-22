@@ -1,0 +1,28 @@
+{
+  "id": "h265_mp4",
+  "name": "H.265 MP4",
+  "group": "Video",
+  "output": {
+    "container": "mp4",
+    "extension": "mp4"
+  },
+  "video": {
+    "enabled": true,
+    "codec": "libx265",
+    "pix_fmt": "yuv420p",
+    "crf": 24
+  },
+  "audio": {
+    "enabled": true,
+    "codec": "aac",
+    "bitrate": "192k",
+    "sample_rate": 48000,
+    "channels": "source"
+  },
+  "filters": {
+    "scale": "keep",
+    "fps": "source",
+    "force_even_dimensions": true
+  }
+}
+

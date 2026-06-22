@@ -1,0 +1,25 @@
+{
+  "id": "jpg_sequence",
+  "name": "JPG Sequence",
+  "group": "Image Sequence",
+  "output": {
+    "container": "image2",
+    "extension": "jpg",
+    "requires_pattern": true
+  },
+  "video": {
+    "enabled": true,
+    "codec": "mjpeg",
+    "pix_fmt": "yuvj420p",
+    "quality": 3
+  },
+  "audio": {
+    "enabled": false
+  },
+  "filters": {
+    "scale": "keep",
+    "fps": "source",
+    "force_even_dimensions": false
+  }
+}
+

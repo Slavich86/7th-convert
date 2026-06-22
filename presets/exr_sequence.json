@@ -1,0 +1,24 @@
+{
+  "id": "exr_sequence",
+  "name": "OpenEXR Sequence",
+  "group": "Image Sequence",
+  "output": {
+    "container": "image2",
+    "extension": "exr",
+    "requires_pattern": true
+  },
+  "video": {
+    "enabled": true,
+    "codec": "exr",
+    "format": "half",
+    "compression": "zip1"
+  },
+  "audio": {
+    "enabled": false
+  },
+  "filters": {
+    "scale": "keep",
+    "fps": "source",
+    "force_even_dimensions": false
+  }
+}

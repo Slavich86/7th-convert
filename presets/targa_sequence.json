@@ -1,0 +1,23 @@
+{
+  "id": "targa_sequence",
+  "name": "Targa Sequence",
+  "group": "Image Sequence",
+  "output": {
+    "container": "image2",
+    "extension": "tga",
+    "requires_pattern": true
+  },
+  "video": {
+    "enabled": true,
+    "codec": "targa",
+    "pix_fmt": "bgra"
+  },
+  "audio": {
+    "enabled": false
+  },
+  "filters": {
+    "scale": "keep",
+    "fps": "source",
+    "force_even_dimensions": false
+  }
+}

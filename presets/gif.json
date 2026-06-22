@@ -1,0 +1,21 @@
+{
+  "id": "gif",
+  "name": "GIF",
+  "group": "Animation",
+  "output": {
+    "container": "gif",
+    "extension": "gif"
+  },
+  "video": {
+    "enabled": true,
+    "codec": "gif"
+  },
+  "audio": {
+    "enabled": false
+  },
+  "filters": {
+    "scale": "keep",
+    "fps": "source",
+    "force_even_dimensions": false
+  }
+}
