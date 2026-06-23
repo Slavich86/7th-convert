@@ -5,15 +5,19 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEvent, Qt  # noqa: E402
+from PySide6.QtCore import QEvent, QSettings, Qt  # noqa: E402
 from PySide6.QtGui import QColor, QKeyEvent, QPixmap  # noqa: E402
 from PySide6.QtWidgets import QApplication, QPushButton  # noqa: E402
 
+import seventh_convert.ui as ui_module  # noqa: E402
 from seventh_convert.ui import (  # noqa: E402
+    COLOR_WORKFLOW_BASIC,
+    COLOR_WORKFLOW_OCIO,
     MainWindow,
     PreviewLabel,
     SequenceFileDialog,
     SelectedInput,
+    _command_color_space_value,
     _fps_from_probe,
     _input_list_items,
     _navigation_places,
@@ -21,11 +25,16 @@ from seventh_convert.ui import (  # noqa: E402
     _frame_text_to_ms,
     _media_summary,
     _ms_to_frame,
+    _parse_progress_time,
+    _progress_duration_for_job,
+    _progress_percent,
+    _progress_total_frames_for_job,
     _parse_positive_float,
     _time_to_ms,
     _default_output_path,
     apply_theme,
 )
+from seventh_convert.command_builder import ConvertJob  # noqa: E402
 from seventh_convert.presets import get_preset  # noqa: E402
 from seventh_convert.sequence import sequence_pattern_from_selection, sequence_start_number  # noqa: E402
 
@@ -38,6 +47,281 @@ class UiTests(unittest.TestCase):
         self.assertEqual(window.windowTitle(), "7th Convert")
         self.assertGreaterEqual(window.tabs.count(), 4)
         window.close()
+        app.processEvents()
+
+    def test_edit_menu_contains_preferences_action(self):
+        app = QApplication.instance() or QApplication([])
+        apply_theme(app)
+        window = MainWindow(use_media=False)
+
+        edit_action = next(action for action in window.menuBar().actions() if action.text() == "&Edit")
+        edit_menu = edit_action.menu()
+        action_labels = [action.text() for action in edit_menu.actions()]
+
+        self.assertIn("Preferences", action_labels)
+        window.close()
+        app.processEvents()
+
+    def test_ocio_preferences_populate_transform_combos_and_persist(self):
+        app = QApplication.instance() or QApplication([])
+        apply_theme(app)
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = QSettings(str(Path(tmp) / "settings.ini"), QSettings.Format.IniFormat)
+            config_path = str(Path(tmp) / "config.ocio")
+            Path(config_path).write_text("ocio_profile_version: 1\n", encoding="utf-8")
+            original_loader = ui_module._load_ocio_color_spaces
+            ui_module._load_ocio_color_spaces = lambda path: (["ACES - ACEScg", "Output - sRGB"], "Loaded 2 color spaces")
+            window = None
+            try:
+                window = MainWindow(use_media=False, settings=settings)
+                window.apply_color_preferences(COLOR_WORKFLOW_OCIO, config_path)
+
+                self.assertEqual(window.color_workflow, COLOR_WORKFLOW_OCIO)
+                self.assertEqual(window.input_transform_combo.itemText(0), "ACES - ACEScg")
+                self.assertEqual(window.input_transform_combo.itemData(0), "ocio:ACES - ACEScg")
+                self.assertEqual(settings.value("color/workflow"), COLOR_WORKFLOW_OCIO)
+                self.assertEqual(settings.value("ocio/config_path"), config_path)
+            finally:
+                ui_module._load_ocio_color_spaces = original_loader
+                if window:
+                    window.close()
+                app.processEvents()
+
+    def test_invalid_ocio_config_falls_back_to_basic_transform_options(self):
+        app = QApplication.instance() or QApplication([])
+        apply_theme(app)
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = QSettings(str(Path(tmp) / "settings.ini"), QSettings.Format.IniFormat)
+            window = MainWindow(use_media=False, settings=settings)
+            window.apply_color_preferences(COLOR_WORKFLOW_OCIO, str(Path(tmp) / "missing.ocio"))
+
+            self.assertEqual(window.color_workflow, COLOR_WORKFLOW_OCIO)
+            self.assertFalse(window.ocio_workflow_is_active())
+            self.assertEqual(window.input_transform_combo.itemData(0), "none")
+            self.assertIn("not found", window.ocio_status)
+
+        window.close()
+        app.processEvents()
+
+    def test_ocio_color_spaces_are_not_sent_to_basic_zscale_builder(self):
+        self.assertEqual(_command_color_space_value("ocio:ACES - ACEScg"), "none")
+        self.assertEqual(_command_color_space_value("srgb"), "srgb")
+
+    def test_ocio_current_preset_generates_lut3d_filter(self):
+        app = QApplication.instance() or QApplication([])
+        apply_theme(app)
+        baker_calls = []
+
+        class FakeConfig:
+            def getColorSpaces(self):
+                return []
+
+        class FakeOcio:
+            class Baker:
+                def setConfig(self, config):
+                    baker_calls.append(("config", config))
+
+                def setFormat(self, value):
+                    baker_calls.append(("format", value))
+
+                def setInputSpace(self, value):
+                    baker_calls.append(("input", value))
+
+                def setTargetSpace(self, value):
+                    baker_calls.append(("target", value))
+
+                def setCubeSize(self, value):
+                    baker_calls.append(("size", value))
+
+                def bake(self):
+                    baker_calls.append(("bake", None))
+                    return "LUT_3D_SIZE 2\n0 0 0\n1 1 1\n"
+
+            class Config:
+                @staticmethod
+                def CreateFromFile(path):
+                    return FakeConfig()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = QSettings(str(Path(tmp) / "settings.ini"), QSettings.Format.IniFormat)
+            config_path = Path(tmp) / "config.ocio"
+            config_path.write_text("fake", encoding="utf-8")
+            original_ocio = ui_module.ocio
+            ui_module.ocio = FakeOcio
+            window = None
+            try:
+                window = MainWindow(use_media=False, settings=settings)
+                window.ocio_color_spaces = ["ACES - ACEScg", "Output - sRGB"]
+                window.apply_color_preferences(COLOR_WORKFLOW_OCIO, str(config_path))
+                window.input_transform_combo.clear()
+                window.output_transform_combo.clear()
+                window.input_transform_combo.addItem("ACES - ACEScg", "ocio:ACES - ACEScg")
+                window.output_transform_combo.addItem("Output - sRGB", "ocio:Output - sRGB")
+
+                preset = window.current_preset()
+            finally:
+                ui_module.ocio = original_ocio
+                if window:
+                    window.close()
+                app.processEvents()
+
+        self.assertIn("lut3d", preset.filters)
+        self.assertTrue(Path(preset.filters["lut3d"]).exists())
+        self.assertEqual(preset.filters["ocio_lut_method"], "PyOpenColorIO Baker iridas_cube")
+        self.assertIn(("format", "iridas_cube"), baker_calls)
+        self.assertIn(("input", "ACES - ACEScg"), baker_calls)
+        self.assertIn(("target", "Output - sRGB"), baker_calls)
+        self.assertIn(("bake", None), baker_calls)
+
+    def test_ocio_conversion_fails_before_ffmpeg_when_lut_generation_fails(self):
+        app = QApplication.instance() or QApplication([])
+        apply_theme(app)
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = QSettings(str(Path(tmp) / "settings.ini"), QSettings.Format.IniFormat)
+            window = MainWindow(use_media=False, settings=settings)
+            window.input_edit.setText(str(Path(tmp) / "input.mov"))
+            window.output_edit.setText(str(Path(tmp) / "output.mp4"))
+            window.input_transform_combo.clear()
+            window.output_transform_combo.clear()
+            window.input_transform_combo.addItem("ACES - ACEScg", "ocio:ACES - ACEScg")
+            window.output_transform_combo.addItem("Output - sRGB", "ocio:Output - sRGB")
+            window.ocio_config_path = str(Path(tmp) / "missing.ocio")
+
+            with self.assertRaisesRegex(ValueError, "LUT generation failed"):
+                window.build_job()
+
+        window.close()
+        app.processEvents()
+
+    def test_ocio_input_transform_changes_preview_display(self):
+        app = QApplication.instance() or QApplication([])
+        apply_theme(app)
+
+        class FakeCPUProcessor:
+            def applyRGBA(self, rgba):
+                return [min(1.0, rgba[0] + 0.25), rgba[1], rgba[2], rgba[3]]
+
+        class FakeProcessor:
+            def getDefaultCPUProcessor(self):
+                return FakeCPUProcessor()
+
+        class FakeConfig:
+            def getColorSpace(self, name):
+                return name == "Output - sRGB"
+
+            def getProcessor(self, src, dst):
+                if src == "ACES - ACEScg" and dst == "Output - sRGB":
+                    return FakeProcessor()
+                raise ValueError("unexpected processor")
+
+        class FakeOcio:
+            class Config:
+                @staticmethod
+                def CreateFromFile(path):
+                    return FakeConfig()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.ocio"
+            config_path.write_text("fake", encoding="utf-8")
+            original_ocio = ui_module.ocio
+            ui_module.ocio = FakeOcio
+            try:
+                pixmap = QPixmap(1, 1)
+                pixmap.fill(QColor(64, 64, 64))
+
+                converted = _display_pixmap_for_input_transform(
+                    pixmap,
+                    "ocio:ACES - ACEScg",
+                    str(config_path),
+                )
+            finally:
+                ui_module.ocio = original_ocio
+
+        displayed = converted.toImage().pixelColor(0, 0)
+        self.assertGreater(displayed.red(), 64)
+        app.processEvents()
+
+    def test_progress_parser_accepts_out_time_text(self):
+        self.assertEqual(_parse_progress_time("out_time", "00:00:02.500"), 2.5)
+        self.assertIsNone(_parse_progress_time("speed", "1x"))
+
+    def test_progress_can_use_sequence_frame_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for frame in range(1001, 1004):
+                (root / f"shot_{frame}.jpg").touch()
+            job = ConvertJob(
+                input=root / "shot_%04d.jpg",
+                output=root / "out.mp4",
+                preset=get_preset("h264_mp4"),
+            )
+
+            self.assertEqual(_progress_total_frames_for_job(job), 3)
+            self.assertAlmostEqual(_progress_percent(2, 3), 66.66666666666666)
+
+    def test_sequence_progress_duration_prefers_frames_over_probe_duration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for frame in range(1, 4):
+                (root / f"shot.{frame:04d}.exr").touch()
+            preset = get_preset("h264_mp4")
+            preset.filters["fps"] = 24
+            job = ConvertJob(
+                input=root / "shot.%04d.exr",
+                output=root / "out.mp4",
+                preset=preset,
+            )
+
+            self.assertAlmostEqual(_progress_duration_for_job(job, 0.04), 3 / 24)
+
+    def test_ocio_preview_scales_large_frames_before_cpu_transform(self):
+        app = QApplication.instance() or QApplication([])
+        apply_theme(app)
+        processed_pixels = []
+
+        class FakeCPUProcessor:
+            def applyRGBA(self, rgba):
+                processed_pixels.append(1)
+                return rgba
+
+        class FakeProcessor:
+            def getDefaultCPUProcessor(self):
+                return FakeCPUProcessor()
+
+        class FakeConfig:
+            def getColorSpace(self, name):
+                return name == "Output - sRGB"
+
+            def getProcessor(self, src, dst):
+                if src == "ACES - ACEScg" and dst == "Output - sRGB":
+                    return FakeProcessor()
+                raise ValueError("unexpected processor")
+
+        class FakeOcio:
+            class Config:
+                @staticmethod
+                def CreateFromFile(path):
+                    return FakeConfig()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.ocio"
+            config_path.write_text("fake", encoding="utf-8")
+            original_ocio = ui_module.ocio
+            ui_module.ocio = FakeOcio
+            try:
+                pixmap = QPixmap(1200, 1200)
+                pixmap.fill(QColor(64, 64, 64))
+
+                converted = _display_pixmap_for_input_transform(
+                    pixmap,
+                    "ocio:ACES - ACEScg",
+                    str(config_path),
+                )
+            finally:
+                ui_module.ocio = original_ocio
+
+        self.assertLess(converted.width(), 1200)
+        self.assertLess(len(processed_pixels), 1200 * 1200)
         app.processEvents()
 
     def test_progress_panel_is_global_below_tabs(self):
@@ -235,17 +519,19 @@ class UiTests(unittest.TestCase):
     def test_jpg_to_exr_defaults_to_srgb_input_and_linear_output_transform(self):
         app = QApplication.instance() or QApplication([])
         apply_theme(app)
-        window = MainWindow(use_media=False)
-        window.input_edit.setText("/tmp/shot_%04d.jpg")
-        window.file_type_combo.setCurrentIndex(window.file_type_combo.findData("exr"))
-        window.refresh_color_transform_defaults()
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = QSettings(str(Path(tmp) / "settings.ini"), QSettings.Format.IniFormat)
+            window = MainWindow(use_media=False, settings=settings)
+            window.input_edit.setText("/tmp/shot_%04d.jpg")
+            window.file_type_combo.setCurrentIndex(window.file_type_combo.findData("exr"))
+            window.refresh_color_transform_defaults()
 
-        preset = window.current_preset()
+            preset = window.current_preset()
 
-        self.assertEqual(window.input_transform_combo.currentData(), "srgb")
-        self.assertEqual(window.output_transform_combo.currentData(), "linear")
-        self.assertEqual(preset.filters["input_color_space"], "srgb")
-        self.assertEqual(preset.filters["output_color_space"], "linear")
+            self.assertEqual(window.input_transform_combo.currentData(), "srgb")
+            self.assertEqual(window.output_transform_combo.currentData(), "linear")
+            self.assertEqual(preset.filters["input_color_space"], "srgb")
+            self.assertEqual(preset.filters["output_color_space"], "linear")
         window.close()
         app.processEvents()
 
@@ -662,17 +948,19 @@ class UiTests(unittest.TestCase):
     def test_video_file_preview_uses_input_transform_display(self):
         app = QApplication.instance() or QApplication([])
         apply_theme(app)
-        window = MainWindow(use_media=False)
-        pixmap = QPixmap(1, 1)
-        pixmap.fill(QColor(128, 128, 128))
-        window._last_video_source_pixmap = pixmap
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = QSettings(str(Path(tmp) / "settings.ini"), QSettings.Format.IniFormat)
+            window = MainWindow(use_media=False, settings=settings)
+            pixmap = QPixmap(1, 1)
+            pixmap.fill(QColor(128, 128, 128))
+            window._last_video_source_pixmap = pixmap
 
-        window._set_combo_data(window.input_transform_combo, "linear")
+            window._set_combo_data(window.input_transform_combo, "linear")
 
-        displayed = window.preview_placeholder._source_pixmap.toImage().pixelColor(0, 0)
-        self.assertGreater(displayed.red(), 128)
-        self.assertGreater(displayed.green(), 128)
-        self.assertGreater(displayed.blue(), 128)
+            displayed = window.preview_placeholder._source_pixmap.toImage().pixelColor(0, 0)
+            self.assertGreater(displayed.red(), 128)
+            self.assertGreater(displayed.green(), 128)
+            self.assertGreater(displayed.blue(), 128)
         window.close()
         app.processEvents()
 

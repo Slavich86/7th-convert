@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, QPoint, Qt, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QColor, QColorSpace, QKeyEvent, QPainter, QPixmap
+from PySide6.QtCore import QEvent, QObject, QPoint, QSize, QSettings, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtGui import QAction, QColor, QColorSpace, QImage, QKeyEvent, QPainter, QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoFrame, QVideoSink
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
@@ -46,10 +48,16 @@ from PySide6.QtWidgets import (
 )
 
 from .command_builder import ConvertJob, build_ffmpeg_args
-from .converter import format_command, validate_job
+from .converter import format_command, same_input_and_output, validate_job
+from .exr_metadata import preserve_exr_metadata_for_job
 from .ffprobe import duration_seconds, probe
 from .presets import Preset, get_preset, load_presets
 from .sequence import sequence_frames, sequence_groups, sequence_start_number, split_sequence_name
+
+try:
+    import PyOpenColorIO as ocio
+except Exception:  # noqa: BLE001 - optional runtime dependency.
+    ocio = None
 
 
 STILL_IMAGE_EXTENSIONS = {
@@ -71,6 +79,10 @@ COLOR_TRANSFORM_OPTIONS = [
     ("Linear", "linear"),
     ("Rec.709", "rec709"),
 ]
+
+COLOR_WORKFLOW_BASIC = "basic"
+COLOR_WORKFLOW_OCIO = "ocio"
+OCIO_PREVIEW_MAX_SIZE = QSize(960, 960)
 
 INPUT_COLOR_DEFAULT_BY_EXTENSION = {
     ".exr": "linear",
@@ -358,13 +370,34 @@ class ConvertWorker(QThread):
             self.log_line.emit(format_command(progress_args))
             self.log_line.emit("")
 
+            progress_duration = _progress_duration_for_job(self.job, duration)
+            total_frames = _progress_total_frames_for_job(self.job)
+            use_frame_progress = total_frames is not None
+            self.log_line.emit("Settings:")
+            self.log_line.emit(f"Input Transform: {_log_transform_value(self.job.preset.filters, 'input')}")
+            self.log_line.emit(f"Output Transform: {_log_transform_value(self.job.preset.filters, 'output')}")
+            if self.job.preset.filters.get("lut3d"):
+                self.log_line.emit(f"OCIO LUT: {self.job.preset.filters['lut3d']}")
+            if self.job.preset.filters.get("ocio_lut_method"):
+                self.log_line.emit(f"OCIO LUT Method: {self.job.preset.filters['ocio_lut_method']}")
+            self.log_line.emit(f"Progress Source: {'frames' if use_frame_progress else 'time'}")
+            self.log_line.emit("")
             log_file = None
             if self.log_path:
                 self.log_path.parent.mkdir(parents=True, exist_ok=True)
                 log_file = self.log_path.open("w", encoding="utf-8")
                 log_file.write("Command:\n")
                 log_file.write(format_command(progress_args))
-                log_file.write("\n\nOutput:\n")
+                log_file.write("\n\nSettings:\n")
+                log_file.write(f"Input Transform: {_log_transform_value(self.job.preset.filters, 'input')}\n")
+                log_file.write(f"Output Transform: {_log_transform_value(self.job.preset.filters, 'output')}\n")
+                if self.job.preset.filters.get("lut3d"):
+                    log_file.write(f"OCIO LUT: {self.job.preset.filters['lut3d']}\n")
+                if self.job.preset.filters.get("ocio_lut_method"):
+                    log_file.write(f"OCIO LUT Method: {self.job.preset.filters['ocio_lut_method']}\n")
+                log_file.write(f"Progress Source: {'frames' if use_frame_progress else 'time'}\n")
+                log_file.write("\nOutput:\n")
+                log_file.flush()
 
             started = time.monotonic()
             process = subprocess.Popen(
@@ -379,25 +412,45 @@ class ConvertWorker(QThread):
             for line in process.stdout:
                 if log_file:
                     log_file.write(line)
+                    log_file.flush()
                 self.log_line.emit(line.rstrip())
 
                 key, _, value = line.strip().partition("=")
-                if key in {"out_time_ms", "out_time_us"}:
-                    try:
-                        current = int(value) / 1_000_000
-                    except ValueError:
-                        continue
-                    percent = _progress_percent(current, duration)
+                current = _parse_progress_time(key, value)
+                if current is not None and not use_frame_progress:
+                    percent = _progress_percent(current, progress_duration)
                     elapsed = max(time.monotonic() - started, 0.001)
                     status = f"{current:.2f}s elapsed, {elapsed:.1f}s wall"
+                    self.progress_changed.emit(percent, status)
+                elif key == "frame" and total_frames:
+                    try:
+                        frame = int(value)
+                    except ValueError:
+                        continue
+                    percent = _progress_percent(frame, float(total_frames))
+                    status = f"{frame}/{total_frames} frames"
                     self.progress_changed.emit(percent, status)
                 elif key == "progress" and value == "end":
                     self.progress_changed.emit(100.0, "Finished")
 
+            return_code = process.wait()
+            if return_code == 0:
+                metadata_result = preserve_exr_metadata_for_job(self.job)
+                if metadata_result.enabled:
+                    message = f"EXR metadata: {metadata_result.message}"
+                    if metadata_result.skipped_frames:
+                        message += f", skipped {metadata_result.skipped_frames} frame(s)"
+                    self.log_line.emit(message)
+                    if log_file:
+                        log_file.write(f"{message}\n")
+                        log_file.flush()
             if log_file:
                 log_file.close()
-            self.finished_with_code.emit(process.wait())
+            self.finished_with_code.emit(return_code)
         except Exception as exc:  # noqa: BLE001 - worker reports concise UI errors.
+            log_file = locals().get("log_file")
+            if log_file:
+                log_file.close()
             self.failed.emit(str(exc))
 
 
@@ -587,13 +640,116 @@ def _navigation_places() -> list[tuple[str, Path]]:
     return unique
 
 
+def _load_ocio_color_spaces(config_path: str) -> tuple[list[str], str]:
+    if not config_path.strip():
+        return [], "No OCIO config selected"
+    path = Path(config_path).expanduser()
+    if not path.exists() or not path.is_file():
+        return [], f"OCIO config not found: {path}"
+    if ocio is None:
+        return [], "PyOpenColorIO is not installed"
+    try:
+        config = ocio.Config.CreateFromFile(str(path))
+        color_spaces = [
+            color_space.getName()
+            for color_space in config.getColorSpaces()
+            if not color_space.isData()
+        ]
+    except Exception as exc:  # noqa: BLE001 - user-facing config validation.
+        return [], f"OCIO config error: {exc}"
+    if not color_spaces:
+        return [], "OCIO config has no color spaces"
+    return color_spaces, f"Loaded {len(color_spaces)} color spaces"
+
+
+class PreferencesDialog(QDialog):
+    def __init__(
+        self,
+        parent: QWidget | None,
+        workflow: str,
+        ocio_config_path: str,
+        ocio_status: str,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Preferences")
+        layout = QVBoxLayout(self)
+
+        color_group = QGroupBox("Color Management")
+        form = QFormLayout(color_group)
+
+        self.workflow_combo = QComboBox()
+        self.workflow_combo.addItem("Basic", COLOR_WORKFLOW_BASIC)
+        self.workflow_combo.addItem("OCIO", COLOR_WORKFLOW_OCIO)
+        self._set_combo_data(self.workflow_combo, workflow)
+        form.addRow("Workflow", self.workflow_combo)
+
+        path_row = QHBoxLayout()
+        self.ocio_config_edit = QLineEdit(ocio_config_path)
+        self.ocio_config_edit.setPlaceholderText("Choose config.ocio")
+        self.ocio_browse_button = QPushButton("Browse")
+        self.ocio_browse_button.clicked.connect(self.browse_ocio_config)
+        path_row.addWidget(self.ocio_config_edit, stretch=1)
+        path_row.addWidget(self.ocio_browse_button)
+        form.addRow("OCIO Config", path_row)
+
+        self.ocio_status_label = QLabel(ocio_status)
+        self.ocio_status_label.setWordWrap(True)
+        form.addRow("Status", self.ocio_status_label)
+
+        self.workflow_combo.currentIndexChanged.connect(lambda _index: self.refresh_status())
+        self.ocio_config_edit.textChanged.connect(lambda _text: self.refresh_status())
+        layout.addWidget(color_group)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.refresh_status()
+
+    def selected_workflow(self) -> str:
+        return str(self.workflow_combo.currentData())
+
+    def selected_ocio_config_path(self) -> str:
+        return self.ocio_config_edit.text().strip()
+
+    def browse_ocio_config(self) -> None:
+        start = self.selected_ocio_config_path()
+        start_path = str(Path(start).expanduser().parent) if start else str(Path.home())
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Choose OCIO config",
+            start_path,
+            "OCIO config (*.ocio);;All files (*)",
+        )
+        if path:
+            self.ocio_config_edit.setText(path)
+
+    def refresh_status(self) -> None:
+        if self.selected_workflow() != COLOR_WORKFLOW_OCIO:
+            self.ocio_status_label.setText("Basic workflow uses built-in transforms")
+            return
+        _color_spaces, status = _load_ocio_color_spaces(self.selected_ocio_config_path())
+        self.ocio_status_label.setText(status)
+
+    def _set_combo_data(self, combo: QComboBox, value: str) -> None:
+        index = combo.findData(value)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+
+
 class MainWindow(QMainWindow):
-    def __init__(self, use_media: bool | None = None) -> None:
+    def __init__(self, use_media: bool | None = None, settings: QSettings | None = None) -> None:
         super().__init__()
         self.setWindowTitle("7th Convert")
         self.resize(1180, 760)
 
         self.presets = load_presets()
+        self.settings = settings or QSettings("7th Convert", "7th Convert")
+        self.color_workflow = str(self.settings.value("color/workflow", COLOR_WORKFLOW_BASIC))
+        self.ocio_config_path = str(self.settings.value("ocio/config_path", ""))
+        self.ocio_color_spaces: list[str] = []
+        self.ocio_status = "No OCIO config selected"
+        self.reload_ocio_config()
         self.current_probe_json: dict | None = None
         self.current_worker: ConvertWorker | None = None
         self.use_media = os.environ.get("QT_QPA_PLATFORM") != "offscreen" if use_media is None else use_media
@@ -640,6 +796,42 @@ class MainWindow(QMainWindow):
         quit_action = QAction("Quit", self)
         quit_action.triggered.connect(self.close)
         file_menu.addAction(quit_action)
+
+        edit_menu = self.menuBar().addMenu("&Edit")
+        preferences_action = QAction("Preferences", self)
+        preferences_action.triggered.connect(self.open_preferences)
+        edit_menu.addAction(preferences_action)
+
+    def reload_ocio_config(self) -> None:
+        if self.color_workflow != COLOR_WORKFLOW_OCIO:
+            self.ocio_color_spaces = []
+            self.ocio_status = "Basic workflow uses built-in transforms"
+            return
+        self.ocio_color_spaces, self.ocio_status = _load_ocio_color_spaces(self.ocio_config_path)
+
+    def ocio_workflow_is_active(self) -> bool:
+        return self.color_workflow == COLOR_WORKFLOW_OCIO and bool(self.ocio_color_spaces)
+
+    def open_preferences(self) -> None:
+        dialog = PreferencesDialog(
+            self,
+            workflow=self.color_workflow,
+            ocio_config_path=self.ocio_config_path,
+            ocio_status=self.ocio_status,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.apply_color_preferences(dialog.selected_workflow(), dialog.selected_ocio_config_path())
+
+    def apply_color_preferences(self, workflow: str, ocio_config_path: str) -> None:
+        self.color_workflow = workflow if workflow in {COLOR_WORKFLOW_BASIC, COLOR_WORKFLOW_OCIO} else COLOR_WORKFLOW_BASIC
+        self.ocio_config_path = ocio_config_path
+        self.settings.setValue("color/workflow", self.color_workflow)
+        self.settings.setValue("ocio/config_path", self.ocio_config_path)
+        self.reload_ocio_config()
+        self.refresh_color_transform_options()
+        self.refresh_color_transform_defaults()
+        self.refresh_preview_display_transform()
 
     def _build_convert_tab(self) -> None:
         tab = QWidget()
@@ -787,12 +979,10 @@ class MainWindow(QMainWindow):
 
         self.input_transform_combo = QComboBox()
         self.output_transform_combo = QComboBox()
-        for label, value in COLOR_TRANSFORM_OPTIONS:
-            self.input_transform_combo.addItem(label, value)
-            self.output_transform_combo.addItem(label, value)
         self.input_transform_combo.currentIndexChanged.connect(lambda _index: self.refresh_preview_display_transform())
         layout.addRow("Input Transform", self.input_transform_combo)
         layout.addRow("Output Transform", self.output_transform_combo)
+        self.refresh_color_transform_options()
 
         self.output_edit = QLineEdit()
         output_row = QHBoxLayout()
@@ -999,7 +1189,36 @@ class MainWindow(QMainWindow):
     def selected_output_transform(self) -> str:
         return str(self.output_transform_combo.currentData())
 
+    def refresh_color_transform_options(self) -> None:
+        previous_input = self.input_transform_combo.currentData()
+        previous_output = self.output_transform_combo.currentData()
+
+        self.input_transform_combo.blockSignals(True)
+        self.output_transform_combo.blockSignals(True)
+        self.input_transform_combo.clear()
+        self.output_transform_combo.clear()
+
+        if self.ocio_workflow_is_active():
+            for color_space in self.ocio_color_spaces:
+                value = f"ocio:{color_space}"
+                self.input_transform_combo.addItem(color_space, value)
+                self.output_transform_combo.addItem(color_space, value)
+        else:
+            for label, value in COLOR_TRANSFORM_OPTIONS:
+                self.input_transform_combo.addItem(label, value)
+                self.output_transform_combo.addItem(label, value)
+
+        if previous_input:
+            self._set_combo_data(self.input_transform_combo, str(previous_input))
+        if previous_output:
+            self._set_combo_data(self.output_transform_combo, str(previous_output))
+
+        self.input_transform_combo.blockSignals(False)
+        self.output_transform_combo.blockSignals(False)
+
     def refresh_color_transform_defaults(self) -> None:
+        if self.ocio_workflow_is_active():
+            return
         input_path = Path(self.input_edit.text()).expanduser() if self.input_edit.text().strip() else None
         input_default = _default_input_color_space(input_path)
         output_default = OUTPUT_COLOR_DEFAULT_BY_FILE_TYPE.get(self.selected_file_type(), "none")
@@ -1041,8 +1260,26 @@ class MainWindow(QMainWindow):
             video["quality"] = _jpeg_quality_percent_to_qscale(self.jpg_quality_slider.value())
         if "audio_codec" in profile_option:
             audio["codec"] = profile_option["audio_codec"]
-        filters["input_color_space"] = self.selected_input_transform()
-        filters["output_color_space"] = self.selected_output_transform()
+        selected_input_transform = self.selected_input_transform()
+        selected_output_transform = self.selected_output_transform()
+        filters["input_color_space"] = _command_color_space_value(selected_input_transform)
+        filters["output_color_space"] = _command_color_space_value(selected_output_transform)
+        ocio_input_color_space = _ocio_color_space_name(selected_input_transform)
+        ocio_output_color_space = _ocio_color_space_name(selected_output_transform)
+        if ocio_input_color_space:
+            filters["ocio_input_color_space"] = ocio_input_color_space
+        if ocio_output_color_space:
+            filters["ocio_output_color_space"] = ocio_output_color_space
+        ocio_lut = _ocio_lut_path(
+            selected_input_transform,
+            selected_output_transform,
+            self.ocio_config_path,
+        )
+        if ocio_lut:
+            filters["lut3d"] = str(ocio_lut)
+            filters["ocio_lut_method"] = "PyOpenColorIO Baker iridas_cube"
+        elif _ocio_lut_is_required(selected_input_transform, selected_output_transform):
+            filters["ocio_lut_error"] = "OCIO conversion selected, but LUT generation failed"
         if self.should_show_fps_control():
             fps = _parse_positive_float(self.fps_edit.text())
             filters["fps"] = fps if fps else "source"
@@ -1086,7 +1323,11 @@ class MainWindow(QMainWindow):
         output_path = Path(self.output_edit.text()).expanduser()
         if not output_path:
             raise ValueError("Output path is required")
+        if same_input_and_output(input_path, output_path):
+            raise ValueError("Output path must be different from input path")
         preset = self.current_preset()
+        if preset.filters.get("ocio_lut_error"):
+            raise ValueError(str(preset.filters["ocio_lut_error"]))
         input_start_number = self.current_input_sequence_start
         if input_start_number is None:
             input_start_number = sequence_start_number(input_path)
@@ -1338,7 +1579,7 @@ class MainWindow(QMainWindow):
             self.preview_placeholder.setText(frame.name)
             self.update_current_frame_label()
             return
-        pixmap = _display_pixmap_for_input_transform(pixmap, self.selected_input_transform())
+        pixmap = self._display_pixmap_for_selected_input_transform(pixmap)
         self.preview_placeholder.set_source_pixmap(pixmap)
         self.position_slider.blockSignals(True)
         self.position_slider.setValue(self.sequence_frame_index)
@@ -1357,8 +1598,16 @@ class MainWindow(QMainWindow):
         pixmap = _display_pixmap_for_input_transform(
             self._last_video_source_pixmap,
             self.selected_input_transform(),
+            self.ocio_config_path,
         )
         self.preview_placeholder.set_source_pixmap(pixmap)
+
+    def _display_pixmap_for_selected_input_transform(self, pixmap: QPixmap) -> QPixmap:
+        return _display_pixmap_for_input_transform(
+            pixmap,
+            self.selected_input_transform(),
+            self.ocio_config_path,
+        )
 
     def handle_media_status(self, status: QMediaPlayer.MediaStatus) -> None:
         if status == QMediaPlayer.MediaStatus.EndOfMedia:
@@ -1652,6 +1901,40 @@ def _progress_percent(current: float, duration: float | None) -> float:
     return min(current / duration, 1.0) * 100
 
 
+def _parse_progress_time(key: str, value: str) -> float | None:
+    if key in {"out_time_ms", "out_time_us"}:
+        try:
+            return int(value) / 1_000_000
+        except ValueError:
+            return None
+    if key == "out_time":
+        parsed_ms = _time_to_ms(value)
+        return parsed_ms / 1000 if parsed_ms is not None else None
+    return None
+
+
+def _progress_duration_for_job(job: ConvertJob, probed_duration: float | None) -> float | None:
+    total_frames = _progress_total_frames_for_job(job)
+    fps = _job_fps(job)
+    if total_frames and fps:
+        return total_frames / fps
+    if probed_duration and probed_duration > 0:
+        return probed_duration
+    return None
+
+
+def _progress_total_frames_for_job(job: ConvertJob) -> int | None:
+    frames = sequence_frames(job.input)
+    return len(frames) if frames else None
+
+
+def _job_fps(job: ConvertJob) -> float | None:
+    fps = job.preset.filters.get("fps")
+    if isinstance(fps, (int, float)) and fps > 0:
+        return float(fps)
+    return None
+
+
 def _ms_to_time(ms: int) -> str:
     total = max(ms, 0) / 1000
     hours = int(total // 3600)
@@ -1725,9 +2008,25 @@ def _is_still_image_path(path: Path | str) -> bool:
     return Path(path).suffix.lower() in STILL_IMAGE_EXTENSIONS
 
 
-def _display_pixmap_for_input_transform(pixmap: QPixmap, input_transform: str) -> QPixmap:
+def _command_color_space_value(value: str) -> str:
+    return "none" if value.startswith("ocio:") else value
+
+
+def _log_transform_value(filters: dict, side: str) -> str:
+    ocio_key = f"ocio_{side}_color_space"
+    basic_key = f"{side}_color_space"
+    return str(filters.get(ocio_key, filters.get(basic_key, "none")))
+
+
+def _display_pixmap_for_input_transform(
+    pixmap: QPixmap,
+    input_transform: str,
+    ocio_config_path: str = "",
+) -> QPixmap:
     if pixmap.isNull():
         return pixmap
+    if input_transform.startswith("ocio:"):
+        return _ocio_display_pixmap(pixmap, input_transform.removeprefix("ocio:"), ocio_config_path)
     if input_transform == "linear":
         source_space = QColorSpace(QColorSpace.NamedColorSpace.SRgbLinear)
     elif input_transform == "rec709":
@@ -1740,6 +2039,115 @@ def _display_pixmap_for_input_transform(pixmap: QPixmap, input_transform: str) -
     if converted.isNull():
         return pixmap
     return QPixmap.fromImage(converted)
+
+
+def _ocio_display_pixmap(pixmap: QPixmap, input_color_space: str, config_path: str) -> QPixmap:
+    if ocio is None or not input_color_space or not config_path.strip():
+        return pixmap
+    path = Path(config_path).expanduser()
+    if not path.exists() or not path.is_file():
+        return pixmap
+    try:
+        config = ocio.Config.CreateFromFile(str(path))
+        display_color_space = _ocio_display_color_space(config)
+        if not display_color_space:
+            return pixmap
+        processor = config.getProcessor(input_color_space, display_color_space).getDefaultCPUProcessor()
+    except Exception:  # noqa: BLE001 - preview fallback must not break playback.
+        return pixmap
+
+    if pixmap.width() > OCIO_PREVIEW_MAX_SIZE.width() or pixmap.height() > OCIO_PREVIEW_MAX_SIZE.height():
+        pixmap = pixmap.scaled(
+            OCIO_PREVIEW_MAX_SIZE,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+    image = pixmap.toImage().convertToFormat(QImage.Format.Format_RGBA8888)
+    for y in range(image.height()):
+        for x in range(image.width()):
+            color = image.pixelColor(x, y)
+            transformed = processor.applyRGBA([
+                color.redF(),
+                color.greenF(),
+                color.blueF(),
+                color.alphaF(),
+            ])
+            image.setPixelColor(x, y, QColor.fromRgbF(
+                _clamp_float(transformed[0]),
+                _clamp_float(transformed[1]),
+                _clamp_float(transformed[2]),
+                _clamp_float(transformed[3]),
+            ))
+    return QPixmap.fromImage(image)
+
+
+def _ocio_display_color_space(config) -> str | None:  # noqa: ANN001 - optional OCIO type.
+    for name in ("Output - sRGB", "Utility - sRGB - Texture", "Utility - Curve - sRGB"):
+        if config.getColorSpace(name):
+            return name
+    try:
+        role_color_space = config.getRoleColorSpace("color_picking")
+    except Exception:  # noqa: BLE001 - compatible with different OCIO configs.
+        return None
+    return role_color_space or None
+
+
+def _ocio_lut_path(input_transform: str, output_transform: str, config_path: str, size: int = 32) -> Path | None:
+    input_color_space = _ocio_color_space_name(input_transform)
+    output_color_space = _ocio_color_space_name(output_transform)
+    if not input_color_space or not output_color_space or input_color_space == output_color_space:
+        return None
+    if ocio is None or not config_path.strip():
+        return None
+    path = Path(config_path).expanduser()
+    if not path.exists() or not path.is_file():
+        return None
+    cache_key = hashlib.sha1(
+        f"ocio-baker-v1|{path.resolve()}|{input_color_space}|{output_color_space}|{size}".encode("utf-8")
+    ).hexdigest()
+    lut_path = Path(tempfile.gettempdir()) / "7th-convert" / "ocio_luts" / f"{cache_key}.cube"
+    if lut_path.exists():
+        return lut_path
+    try:
+        config = ocio.Config.CreateFromFile(str(path))
+        _write_ocio_baker_cube_lut(lut_path, config, input_color_space, output_color_space, size)
+    except Exception:  # noqa: BLE001 - invalid OCIO conversion should fall back to no LUT.
+        return None
+    return lut_path
+
+
+def _ocio_lut_is_required(input_transform: str, output_transform: str) -> bool:
+    input_color_space = _ocio_color_space_name(input_transform)
+    output_color_space = _ocio_color_space_name(output_transform)
+    return bool(input_color_space and output_color_space and input_color_space != output_color_space)
+
+
+def _ocio_color_space_name(value: str) -> str | None:
+    if not value.startswith("ocio:"):
+        return None
+    name = value.removeprefix("ocio:").strip()
+    return name or None
+
+
+def _write_ocio_baker_cube_lut(
+    path: Path,
+    config,  # noqa: ANN001 - optional OCIO type.
+    input_color_space: str,
+    output_color_space: str,
+    size: int,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    baker = ocio.Baker()
+    baker.setConfig(config)
+    baker.setFormat("iridas_cube")
+    baker.setInputSpace(input_color_space)
+    baker.setTargetSpace(output_color_space)
+    baker.setCubeSize(size)
+    path.write_text(baker.bake(), encoding="utf-8")
+
+
+def _clamp_float(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
 
 
 def _default_input_color_space(path: Path | None) -> str:

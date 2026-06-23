@@ -124,6 +124,10 @@ def _append_audio_args(args: list[str], audio: dict) -> None:
 def _video_filter(filters: dict) -> str | None:
     parts: list[str] = []
 
+    lut3d = filters.get("lut3d")
+    if lut3d:
+        parts.append(f"lut3d=file='{_escape_filter_path(str(lut3d))}':interp=tetrahedral")
+
     input_color = filters.get("input_color_space", "none")
     output_color = filters.get("output_color_space", "none")
     color_filter = _color_transfer_filter(str(input_color), str(output_color))
@@ -162,3 +166,7 @@ def _color_transfer_filter(input_color: str, output_color: str) -> str | None:
     if not input_transfer or not output_transfer:
         return None
     return f"zscale=transferin={input_transfer}:transfer={output_transfer}"
+
+
+def _escape_filter_path(path: str) -> str:
+    return path.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")

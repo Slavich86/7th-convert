@@ -1,7 +1,9 @@
 from pathlib import Path
+import tempfile
 import unittest
 
 from seventh_convert.command_builder import ConvertJob, build_ffmpeg_args
+from seventh_convert.converter import validate_job
 from seventh_convert.presets import get_preset
 
 
@@ -122,6 +124,32 @@ class CommandBuilderTests(unittest.TestCase):
         args = build_ffmpeg_args(job)
 
         self.assertTrue(args[args.index("-vf") + 1].startswith("zscale=transferin=bt709:transfer=iec61966-2-1"))
+
+    def test_lut3d_filter_is_added_before_other_video_filters(self):
+        preset = get_preset("h264_mp4")
+        preset.filters["lut3d"] = "/tmp/ocio.cube"
+        job = ConvertJob(
+            input=Path("input.mov"),
+            output=Path("output.mp4"),
+            preset=preset,
+        )
+
+        args = build_ffmpeg_args(job)
+
+        vf = args[args.index("-vf") + 1]
+        self.assertTrue(vf.startswith("lut3d=file='/tmp/ocio.cube':interp=tetrahedral"))
+
+    def test_validate_job_rejects_same_sequence_input_and_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "shot.0001.exr").touch()
+
+            with self.assertRaisesRegex(ValueError, "different from input"):
+                validate_job(ConvertJob(
+                    input=root / "shot.%04d.exr",
+                    output=root / "shot.%04d.exr",
+                    preset=get_preset("exr_sequence"),
+                ))
 
 
 if __name__ == "__main__":
