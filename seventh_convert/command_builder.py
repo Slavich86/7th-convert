@@ -18,6 +18,7 @@ class ConvertJob:
     input: Path
     output: Path
     preset: Preset
+    audio_input: Path | None = None
     input_start_number: int | None = None
     output_start_number: int | None = None
     in_point: str | None = None
@@ -40,6 +41,8 @@ def build_ffmpeg_args(job: ConvertJob) -> list[str]:
         args.extend(["-start_number", str(job.input_start_number)])
 
     args.extend(["-i", str(job.input)])
+    if job.audio_input is not None:
+        args.extend(["-i", str(job.audio_input)])
 
     if job.out_point:
         args.extend(["-to", job.out_point])
@@ -47,6 +50,11 @@ def build_ffmpeg_args(job: ConvertJob) -> list[str]:
     video = job.preset.video
     audio = job.preset.audio
     filters = job.preset.filters
+    if job.audio_input is not None:
+        if video.get("enabled", True):
+            args.extend(["-map", "0:v:0"])
+        if audio.get("enabled", True):
+            args.extend(["-map", "1:a:0"])
 
     if video.get("enabled", True):
         _append_video_args(args, video, filters)
@@ -55,6 +63,8 @@ def build_ffmpeg_args(job: ConvertJob) -> list[str]:
 
     if audio.get("enabled", True):
         _append_audio_args(args, audio)
+        if audio.get("shortest"):
+            args.append("-shortest")
     else:
         args.append("-an")
 
@@ -69,6 +79,15 @@ def _append_video_args(args: list[str], video: dict, filters: dict) -> None:
     codec = video.get("codec")
     if codec:
         args.extend(["-c:v", codec])
+        if codec == "copy":
+            return
+
+    encoder_options = video.get("encoder_options", {})
+    if isinstance(encoder_options, dict):
+        for key, value in encoder_options.items():
+            if value is None:
+                continue
+            args.extend([f"-{key}", str(value)])
 
     profile = video.get("profile")
     if profile:
@@ -98,7 +117,12 @@ def _append_video_args(args: list[str], video: dict, filters: dict) -> None:
     if quality is not None:
         args.extend(["-q:v", str(quality)])
 
-    vf = _video_filter(filters)
+    for key in ("color_primaries", "color_trc", "colorspace", "color_range"):
+        value = video.get(key)
+        if value:
+            args.extend([f"-{key}", str(value)])
+
+    vf = _video_filter(filters, video)
     if vf:
         args.extend(["-vf", vf])
 
@@ -121,7 +145,7 @@ def _append_audio_args(args: list[str], audio: dict) -> None:
         args.extend(["-ac", str(channels)])
 
 
-def _video_filter(filters: dict) -> str | None:
+def _video_filter(filters: dict, video: dict | None = None) -> str | None:
     parts: list[str] = []
 
     lut3d = filters.get("lut3d")
@@ -134,11 +158,31 @@ def _video_filter(filters: dict) -> str | None:
     if color_filter:
         parts.append(color_filter)
 
+    metadata_filter = _color_metadata_filter(video or {})
+    if metadata_filter:
+        parts.append(metadata_filter)
+
+    pixel_aspect = _positive_float(filters.get("output_pixel_aspect"))
+    anamorph_mode = filters.get("anamorph_output", "preserve")
+    baked_pixel_aspect = False
+    if pixel_aspect and pixel_aspect != 1.0:
+        if anamorph_mode == "bake":
+            width_expr = f"trunc(iw*{pixel_aspect}/2)*2" if filters.get("force_even_dimensions", False) else f"round(iw*{pixel_aspect})"
+            parts.append(f"scale={width_expr}:ih")
+            parts.append("setsar=1")
+            baked_pixel_aspect = True
+        elif anamorph_mode == "preserve":
+            parts.append(f"setsar={pixel_aspect}")
+
     scale = filters.get("scale", "keep")
     force_even = filters.get("force_even_dimensions", False)
     if isinstance(scale, dict):
         mode = scale.get("mode")
-        if mode == "width":
+        if mode == "dimensions":
+            width = int(scale["width"])
+            height = int(scale["height"])
+            parts.append(f"scale={width}:{height}")
+        elif mode == "width":
             width = int(scale["value"])
             height_expr = "-2" if force_even else "-1"
             parts.append(f"scale={width}:{height_expr}")
@@ -146,7 +190,7 @@ def _video_filter(filters: dict) -> str | None:
             height = int(scale["value"])
             width_expr = "-2" if force_even else "-1"
             parts.append(f"scale={width_expr}:{height}")
-    elif force_even:
+    elif force_even and not baked_pixel_aspect:
         parts.append("scale=trunc(iw/2)*2:trunc(ih/2)*2")
 
     fps = filters.get("fps", "source")
@@ -168,5 +212,30 @@ def _color_transfer_filter(input_color: str, output_color: str) -> str | None:
     return f"zscale=transferin={input_transfer}:transfer={output_transfer}"
 
 
+def _color_metadata_filter(video: dict) -> str | None:
+    options = []
+    key_map = {
+        "color_primaries": "color_primaries",
+        "color_trc": "color_trc",
+        "colorspace": "colorspace",
+        "color_range": "range",
+    }
+    for source_key, filter_key in key_map.items():
+        value = video.get(source_key)
+        if value:
+            options.append(f"{filter_key}={value}")
+    if not options:
+        return None
+    return f"setparams={':'.join(options)}"
+
+
 def _escape_filter_path(path: str) -> str:
     return path.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+
+
+def _positive_float(value: object) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if result > 0 else None

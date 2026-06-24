@@ -8,19 +8,29 @@ from pathlib import Path
 from .command_builder import ConvertJob, build_ffmpeg_args
 from .exr_metadata import preserve_exr_metadata_for_job
 from .ffprobe import duration_seconds, probe
-from .sequence import sequence_pattern_has_frames
+from .sequence import sequence_frames, sequence_pattern_has_frames
 
 
 def validate_job(job: ConvertJob) -> None:
     if not job.input.exists() and not sequence_pattern_has_frames(job.input):
         raise FileNotFoundError(f"Input does not exist: {job.input}")
+    if job.audio_input is not None and not job.audio_input.exists():
+        raise FileNotFoundError(f"Audio input does not exist: {job.audio_input}")
     if same_input_and_output(job.input, job.output):
         raise ValueError("Output path must be different from input path")
-    if job.output.exists() and not job.overwrite:
+    if output_exists_for_job(job) and not job.overwrite:
         raise FileExistsError(f"Output already exists: {job.output}")
     if job.preset.output.get("requires_pattern") and "%" not in job.output.name:
         raise ValueError("Image sequence output must contain a frame pattern such as %04d")
     job.output.parent.mkdir(parents=True, exist_ok=True)
+
+
+def output_exists_for_job(job: ConvertJob) -> bool:
+    if job.output.exists():
+        return True
+    if "%" in job.output.name:
+        return bool(sequence_frames(job.output))
+    return False
 
 
 def run_convert(job: ConvertJob, log_path: Path | None = None) -> int:

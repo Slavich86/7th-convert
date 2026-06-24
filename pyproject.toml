@@ -12,6 +12,13 @@ dependencies = [
 7th-convert = "seventh_convert.cli:main"
 7th-convert-ui = "seventh_convert.ui:main"
 
+[tool.setuptools.package-data]
+seventh_convert = [
+  "color_configs/README.md",
+  "color_configs/*/config.ocio",
+  "color_configs/*/luts/*"
+]
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"

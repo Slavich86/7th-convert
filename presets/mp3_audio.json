@@ -1,17 +1,18 @@
 {
-  "id": "wav_pcm",
-  "name": "WAV PCM 16-bit",
+  "id": "mp3_audio",
+  "name": "MP3 Audio",
   "group": "Audio",
   "output": {
-    "container": "wav",
-    "extension": "wav"
+    "container": "mp3",
+    "extension": "mp3"
   },
   "video": {
     "enabled": false
   },
   "audio": {
     "enabled": true,
-    "codec": "pcm_s16le",
+    "codec": "libmp3lame",
+    "bitrate": "192k",
     "sample_rate": 48000,
     "channels": "source"
   },

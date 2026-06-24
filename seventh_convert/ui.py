@@ -2,22 +2,26 @@ from __future__ import annotations
 
 import json
 import hashlib
+import math
 import os
 import re
 import subprocess
 import sys
 import tempfile
 import time
+from importlib import resources
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from functools import lru_cache
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QSize, QSettings, Qt, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QColor, QColorSpace, QImage, QKeyEvent, QPainter, QPixmap
+from PySide6.QtGui import QAction, QColor, QColorSpace, QImage, QKeyEvent, QKeySequence, QPainter, QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoFrame, QVideoSink
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QApplication,
+    QAbstractItemView,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -34,11 +38,13 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QSlider,
+    QSpinBox,
     QSplitter,
     QTabWidget,
     QTableWidget,
@@ -48,7 +54,7 @@ from PySide6.QtWidgets import (
 )
 
 from .command_builder import ConvertJob, build_ffmpeg_args
-from .converter import format_command, same_input_and_output, validate_job
+from .converter import format_command, output_exists_for_job, same_input_and_output, validate_job
 from .exr_metadata import preserve_exr_metadata_for_job
 from .ffprobe import duration_seconds, probe
 from .presets import Preset, get_preset, load_presets
@@ -58,6 +64,11 @@ try:
     import PyOpenColorIO as ocio
 except Exception:  # noqa: BLE001 - optional runtime dependency.
     ocio = None
+
+try:
+    import numpy as np
+except Exception:  # noqa: BLE001 - optional runtime dependency for faster OCIO preview.
+    np = None
 
 
 STILL_IMAGE_EXTENSIONS = {
@@ -81,8 +92,54 @@ COLOR_TRANSFORM_OPTIONS = [
 ]
 
 COLOR_WORKFLOW_BASIC = "basic"
+COLOR_WORKFLOW_BUILTIN_OCIO = "builtin_ocio"
 COLOR_WORKFLOW_OCIO = "ocio"
 OCIO_PREVIEW_MAX_SIZE = QSize(960, 960)
+PIXEL_ASPECT_AUTO = "auto"
+PIXEL_ASPECT_MANUAL = "manual"
+ANAMORPH_OUTPUT_PRESERVE = "preserve"
+ANAMORPH_OUTPUT_BAKE = "bake"
+
+
+@dataclass(frozen=True)
+class BuiltinOcioConfig:
+    id: str
+    label: str
+    config_relative_path: str
+    default_input_by_extension: dict[str, str]
+    default_output_by_file_type: dict[str, str]
+
+
+BUILTIN_OCIO_CONFIGS = {
+    "nuke-default": BuiltinOcioConfig(
+        id="nuke-default",
+        label="Nuke Default",
+        config_relative_path="color_configs/nuke-default/config.ocio",
+        default_input_by_extension={
+            ".cin": "Cineon",
+            ".cineon": "Cineon",
+            ".dpx": "Cineon",
+            ".exr": "linear",
+            ".gif": "sRGB",
+            ".jpeg": "sRGB",
+            ".jpg": "sRGB",
+            ".mov": "rec709",
+            ".mp4": "sRGB",
+            ".png": "sRGB",
+            ".targa": "sRGB",
+            ".tga": "sRGB",
+        },
+        default_output_by_file_type={
+            "exr": "linear",
+            "gif": "sRGB",
+            "jpg": "sRGB",
+            "mov": "rec709",
+            "mp4": "sRGB",
+            "png": "sRGB",
+            "targa": "sRGB",
+        },
+    )
+}
 
 INPUT_COLOR_DEFAULT_BY_EXTENSION = {
     ".exr": "linear",
@@ -90,7 +147,7 @@ INPUT_COLOR_DEFAULT_BY_EXTENSION = {
     ".jpeg": "srgb",
     ".jpg": "srgb",
     ".mov": "rec709",
-    ".mp4": "rec709",
+    ".mp4": "srgb",
     ".png": "srgb",
     ".targa": "srgb",
     ".tga": "srgb",
@@ -101,7 +158,7 @@ OUTPUT_COLOR_DEFAULT_BY_FILE_TYPE = {
     "gif": "srgb",
     "jpg": "srgb",
     "mov": "rec709",
-    "mp4": "rec709",
+    "mp4": "srgb",
     "png": "srgb",
     "targa": "srgb",
 }
@@ -213,6 +270,33 @@ OUTPUT_OPTIONS = {
                 },
                 "default_profile": "high",
             },
+            "h264_nvenc": {
+                "label": "H.264 NVENC",
+                "preset": "h264_mp4",
+                "profile_label": "Quality",
+                "video": {"codec": "h264_nvenc", "crf": None},
+                "profiles": {
+                    "balanced": {
+                        "label": "Balanced",
+                        "profile": "high",
+                        "pix_fmt": "yuv420p",
+                        "encoder_options": {"preset": "p5", "tune": "hq", "cq": 20},
+                    },
+                    "quality": {
+                        "label": "Quality",
+                        "profile": "high",
+                        "pix_fmt": "yuv420p",
+                        "encoder_options": {"preset": "p7", "tune": "hq", "cq": 18},
+                    },
+                    "fast": {
+                        "label": "Fast",
+                        "profile": "high",
+                        "pix_fmt": "yuv420p",
+                        "encoder_options": {"preset": "p3", "tune": "hq", "cq": 23},
+                    },
+                },
+                "default_profile": "balanced",
+            },
             "h265": {
                 "label": "H.265",
                 "preset": "h265_mp4",
@@ -221,6 +305,33 @@ OUTPUT_OPTIONS = {
                     "main10": {"label": "Main 10", "profile": None, "pix_fmt": "yuv420p10le"},
                 },
                 "default_profile": "main",
+            },
+            "h265_nvenc": {
+                "label": "H.265 NVENC",
+                "preset": "h265_mp4",
+                "profile_label": "Quality",
+                "video": {"codec": "hevc_nvenc", "crf": None},
+                "profiles": {
+                    "balanced": {
+                        "label": "Balanced",
+                        "profile": "main",
+                        "pix_fmt": "yuv420p",
+                        "encoder_options": {"preset": "p5", "tune": "hq", "cq": 22},
+                    },
+                    "quality": {
+                        "label": "Quality",
+                        "profile": "main",
+                        "pix_fmt": "yuv420p",
+                        "encoder_options": {"preset": "p7", "tune": "hq", "cq": 19},
+                    },
+                    "fast": {
+                        "label": "Fast",
+                        "profile": "main",
+                        "pix_fmt": "yuv420p",
+                        "encoder_options": {"preset": "p3", "tune": "hq", "cq": 25},
+                    },
+                },
+                "default_profile": "balanced",
             },
         },
         "default_codec": "h264",
@@ -249,14 +360,64 @@ OUTPUT_OPTIONS = {
             "pcm": {
                 "label": "PCM",
                 "preset": "wav_pcm",
+                "profile_label": "Bit Depth / Sample Rate",
                 "profiles": {
-                    "pcm_s24le": {"label": "PCM 24-bit", "audio_codec": "pcm_s24le"},
-                    "pcm_s16le": {"label": "PCM 16-bit", "audio_codec": "pcm_s16le"},
+                    "pcm_s16le_44100": {"label": "PCM 16-bit / 44.1 kHz", "audio_codec": "pcm_s16le", "sample_rate": 44100},
+                    "pcm_s16le_48000": {"label": "PCM 16-bit / 48 kHz", "audio_codec": "pcm_s16le", "sample_rate": 48000},
+                    "pcm_s16le_24000": {"label": "PCM 16-bit / 24 kHz", "audio_codec": "pcm_s16le", "sample_rate": 24000},
+                    "pcm_s16le_14000": {"label": "PCM 16-bit / 14 kHz", "audio_codec": "pcm_s16le", "sample_rate": 14000},
+                    "pcm_s16le_8000": {"label": "PCM 16-bit / 8 kHz", "audio_codec": "pcm_s16le", "sample_rate": 8000},
                 },
-                "default_profile": "pcm_s24le",
+                "default_profile": "pcm_s16le_48000",
             }
         },
         "default_codec": "pcm",
+    },
+    "mp3": {
+        "label": "mp3",
+        "extension": "mp3",
+        "codecs": {
+            "mp3": {
+                "label": "MP3",
+                "preset": "mp3_audio",
+                "profile_label": "Bitrate / Sample Rate",
+                "profiles": {
+                    "mp3_256k_48000": {"label": "256 kb/s / 48 kHz", "audio_codec": "libmp3lame", "bitrate": "256k", "sample_rate": 48000},
+                    "mp3_256k_44100": {"label": "256 kb/s / 44.1 kHz", "audio_codec": "libmp3lame", "bitrate": "256k", "sample_rate": 44100},
+                    "mp3_192k_48000": {"label": "192 kb/s / 48 kHz", "audio_codec": "libmp3lame", "bitrate": "192k", "sample_rate": 48000},
+                    "mp3_192k_44100": {"label": "192 kb/s / 44.1 kHz", "audio_codec": "libmp3lame", "bitrate": "192k", "sample_rate": 44100},
+                    "mp3_128k_44100": {"label": "128 kb/s / 44.1 kHz", "audio_codec": "libmp3lame", "bitrate": "128k", "sample_rate": 44100},
+                    "mp3_96k_24000": {"label": "96 kb/s / 24 kHz", "audio_codec": "libmp3lame", "bitrate": "96k", "sample_rate": 24000},
+                    "mp3_64k_14000": {"label": "64 kb/s / 14 kHz", "audio_codec": "libmp3lame", "bitrate": "64k", "sample_rate": 14000},
+                    "mp3_32k_8000": {"label": "32 kb/s / 8 kHz", "audio_codec": "libmp3lame", "bitrate": "32k", "sample_rate": 8000},
+                },
+                "default_profile": "mp3_192k_48000",
+            }
+        },
+        "default_codec": "mp3",
+    },
+    "aac": {
+        "label": "aac",
+        "extension": "aac",
+        "codecs": {
+            "aac": {
+                "label": "AAC",
+                "preset": "aac_audio",
+                "profile_label": "Bitrate / Sample Rate",
+                "profiles": {
+                    "aac_256k_48000": {"label": "256 kb/s / 48 kHz", "audio_codec": "aac", "bitrate": "256k", "sample_rate": 48000},
+                    "aac_256k_44100": {"label": "256 kb/s / 44.1 kHz", "audio_codec": "aac", "bitrate": "256k", "sample_rate": 44100},
+                    "aac_192k_48000": {"label": "192 kb/s / 48 kHz", "audio_codec": "aac", "bitrate": "192k", "sample_rate": 48000},
+                    "aac_192k_44100": {"label": "192 kb/s / 44.1 kHz", "audio_codec": "aac", "bitrate": "192k", "sample_rate": 44100},
+                    "aac_128k_44100": {"label": "128 kb/s / 44.1 kHz", "audio_codec": "aac", "bitrate": "128k", "sample_rate": 44100},
+                    "aac_96k_24000": {"label": "96 kb/s / 24 kHz", "audio_codec": "aac", "bitrate": "96k", "sample_rate": 24000},
+                    "aac_64k_14000": {"label": "64 kb/s / 14 kHz", "audio_codec": "aac", "bitrate": "64k", "sample_rate": 14000},
+                    "aac_32k_8000": {"label": "32 kb/s / 8 kHz", "audio_codec": "aac", "bitrate": "32k", "sample_rate": 8000},
+                },
+                "default_profile": "aac_192k_48000",
+            }
+        },
+        "default_codec": "aac",
     },
 }
 
@@ -320,14 +481,17 @@ class PreviewLabel(QLabel):
     def __init__(self, text: str = "", parent: QWidget | None = None) -> None:
         super().__init__(text, parent)
         self._source_pixmap = QPixmap()
+        self._source_pixel_aspect = 1.0
 
-    def set_source_pixmap(self, pixmap: QPixmap) -> None:
+    def set_source_pixmap(self, pixmap: QPixmap, pixel_aspect: float = 1.0) -> None:
         self._source_pixmap = QPixmap(pixmap)
+        self._source_pixel_aspect = _normalized_pixel_aspect(pixel_aspect)
         self.setText("")
         self._refresh_scaled_pixmap()
 
     def clear_source_pixmap(self) -> None:
         self._source_pixmap = QPixmap()
+        self._source_pixel_aspect = 1.0
         super().setPixmap(QPixmap())
 
     def clear(self) -> None:
@@ -341,11 +505,60 @@ class PreviewLabel(QLabel):
     def _refresh_scaled_pixmap(self) -> None:
         if self._source_pixmap.isNull() or self.width() <= 0 or self.height() <= 0:
             return
+        source_width = self._source_pixmap.width() * self._source_pixel_aspect
+        source_height = self._source_pixmap.height()
+        if source_width <= 0 or source_height <= 0:
+            return
+        container_width = self.width()
+        container_height = self.height()
+        container_ratio = container_width / container_height
+        source_ratio = source_width / source_height
+        if source_ratio >= container_ratio:
+            display_width = container_width
+            display_height = max(1, round(container_width / source_ratio))
+        else:
+            display_height = container_height
+            display_width = max(1, round(container_height * source_ratio))
         super().setPixmap(self._source_pixmap.scaled(
-            self.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
+            display_width,
+            display_height,
+            Qt.AspectRatioMode.IgnoreAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         ))
+
+
+class MetadataTable(QTableWidget):
+    def contextMenuEvent(self, event) -> None:  # noqa: ANN001 - Qt override signature.
+        index = self.indexAt(event.pos())
+        row_is_selected = any(selected.row() == index.row() for selected in self.selectedIndexes()) if index.isValid() else False
+        if index.isValid() and not row_is_selected:
+            self.selectRow(index.row())
+
+        menu = QMenu(self)
+        copy_action = menu.addAction("Copy")
+        copy_action.setShortcut(QKeySequence(QKeySequence.StandardKey.Copy))
+        copy_action.setEnabled(bool(self.selectedIndexes()))
+        copy_action.triggered.connect(self.copy_selected_rows)
+        menu.exec(event.globalPos())
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.matches(QKeySequence.StandardKey.Copy):
+            self.copy_selected_rows()
+            return
+        super().keyPressEvent(event)
+
+    def copy_selected_rows(self) -> None:
+        rows = sorted({index.row() for index in self.selectedIndexes() if not self.isRowHidden(index.row())})
+        if not rows:
+            return
+        lines = []
+        for row in rows:
+            values = []
+            for column in range(self.columnCount()):
+                item = self.item(row, column)
+                values.append(item.text() if item else "")
+            lines.append("\t".join(values))
+        QApplication.clipboard().setText("\n".join(lines))
 
 
 class ConvertWorker(QThread):
@@ -662,12 +875,23 @@ def _load_ocio_color_spaces(config_path: str) -> tuple[list[str], str]:
     return color_spaces, f"Loaded {len(color_spaces)} color spaces"
 
 
+def _builtin_ocio_config_path(config_id: str) -> str:
+    config = BUILTIN_OCIO_CONFIGS.get(config_id) or BUILTIN_OCIO_CONFIGS["nuke-default"]
+    path = resources.files("seventh_convert").joinpath(config.config_relative_path)
+    return str(path)
+
+
+def _builtin_ocio_config(config_id: str) -> BuiltinOcioConfig:
+    return BUILTIN_OCIO_CONFIGS.get(config_id) or BUILTIN_OCIO_CONFIGS["nuke-default"]
+
+
 class PreferencesDialog(QDialog):
     def __init__(
         self,
         parent: QWidget | None,
         workflow: str,
         ocio_config_path: str,
+        builtin_ocio_config: str,
         ocio_status: str,
     ) -> None:
         super().__init__(parent)
@@ -678,10 +902,14 @@ class PreferencesDialog(QDialog):
         form = QFormLayout(color_group)
 
         self.workflow_combo = QComboBox()
-        self.workflow_combo.addItem("Basic", COLOR_WORKFLOW_BASIC)
+        self.workflow_combo.addItem("Nuke", COLOR_WORKFLOW_BUILTIN_OCIO)
         self.workflow_combo.addItem("OCIO", COLOR_WORKFLOW_OCIO)
-        self._set_combo_data(self.workflow_combo, workflow)
-        form.addRow("Workflow", self.workflow_combo)
+        self._custom_ocio_config_path = ocio_config_path
+        self._set_combo_data(
+            self.workflow_combo,
+            workflow if workflow in {COLOR_WORKFLOW_BUILTIN_OCIO, COLOR_WORKFLOW_OCIO} else COLOR_WORKFLOW_BUILTIN_OCIO,
+        )
+        form.addRow("Color Management", self.workflow_combo)
 
         path_row = QHBoxLayout()
         self.ocio_config_edit = QLineEdit(ocio_config_path)
@@ -697,7 +925,7 @@ class PreferencesDialog(QDialog):
         form.addRow("Status", self.ocio_status_label)
 
         self.workflow_combo.currentIndexChanged.connect(lambda _index: self.refresh_status())
-        self.ocio_config_edit.textChanged.connect(lambda _text: self.refresh_status())
+        self.ocio_config_edit.textChanged.connect(self.handle_ocio_config_text_changed)
         layout.addWidget(color_group)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -710,7 +938,17 @@ class PreferencesDialog(QDialog):
         return str(self.workflow_combo.currentData())
 
     def selected_ocio_config_path(self) -> str:
+        if self.selected_workflow() != COLOR_WORKFLOW_OCIO:
+            return self._custom_ocio_config_path.strip()
         return self.ocio_config_edit.text().strip()
+
+    def selected_builtin_ocio_config(self) -> str:
+        return "nuke-default"
+
+    def handle_ocio_config_text_changed(self, text: str) -> None:
+        if self.selected_workflow() == COLOR_WORKFLOW_OCIO:
+            self._custom_ocio_config_path = text.strip()
+        self.refresh_status()
 
     def browse_ocio_config(self) -> None:
         start = self.selected_ocio_config_path()
@@ -725,9 +963,22 @@ class PreferencesDialog(QDialog):
             self.ocio_config_edit.setText(path)
 
     def refresh_status(self) -> None:
-        if self.selected_workflow() != COLOR_WORKFLOW_OCIO:
-            self.ocio_status_label.setText("Basic workflow uses built-in transforms")
+        workflow = self.selected_workflow()
+        self.ocio_config_edit.setEnabled(workflow == COLOR_WORKFLOW_OCIO)
+        self.ocio_browse_button.setEnabled(workflow == COLOR_WORKFLOW_OCIO)
+        if workflow == COLOR_WORKFLOW_BUILTIN_OCIO:
+            config = _builtin_ocio_config(self.selected_builtin_ocio_config())
+            if self.ocio_config_edit.text() != config.label:
+                self.ocio_config_edit.blockSignals(True)
+                self.ocio_config_edit.setText(config.label)
+                self.ocio_config_edit.blockSignals(False)
+            _color_spaces, status = _load_ocio_color_spaces(_builtin_ocio_config_path(config.id))
+            self.ocio_status_label.setText(f"{config.label}: {status}")
             return
+        if self.ocio_config_edit.text() == _builtin_ocio_config(self.selected_builtin_ocio_config()).label:
+            self.ocio_config_edit.blockSignals(True)
+            self.ocio_config_edit.setText(self._custom_ocio_config_path)
+            self.ocio_config_edit.blockSignals(False)
         _color_spaces, status = _load_ocio_color_spaces(self.selected_ocio_config_path())
         self.ocio_status_label.setText(status)
 
@@ -747,6 +998,7 @@ class MainWindow(QMainWindow):
         self.settings = settings or QSettings("7th Convert", "7th Convert")
         self.color_workflow = str(self.settings.value("color/workflow", COLOR_WORKFLOW_BASIC))
         self.ocio_config_path = str(self.settings.value("ocio/config_path", ""))
+        self.builtin_ocio_config = str(self.settings.value("ocio/builtin_config", "nuke-default"))
         self.ocio_color_spaces: list[str] = []
         self.ocio_status = "No OCIO config selected"
         self.reload_ocio_config()
@@ -754,6 +1006,8 @@ class MainWindow(QMainWindow):
         self.current_worker: ConvertWorker | None = None
         self.use_media = os.environ.get("QT_QPA_PLATFORM") != "offscreen" if use_media is None else use_media
         self.current_fps = 25.0
+        self.current_source_raster_size: QSize | None = None
+        self._updating_scale_controls = False
 
         self.player: QMediaPlayer | None = None
         self.audio_output: QAudioOutput | None = None
@@ -770,6 +1024,10 @@ class MainWindow(QMainWindow):
         self.current_input_sequence_end_text: str | None = None
         self.sequence_timer = QTimer(self)
         self.sequence_timer.timeout.connect(self.advance_sequence_frame)
+        self.input_edit_refresh_timer = QTimer(self)
+        self.input_edit_refresh_timer.setSingleShot(True)
+        self.input_edit_refresh_timer.timeout.connect(self.refresh_from_manual_input_path)
+        self.output_path_is_manual = False
         self.sequence_preview_frames: list[Path] = []
         self.sequence_frame_index = 0
 
@@ -803,31 +1061,62 @@ class MainWindow(QMainWindow):
         edit_menu.addAction(preferences_action)
 
     def reload_ocio_config(self) -> None:
-        if self.color_workflow != COLOR_WORKFLOW_OCIO:
+        if self.color_workflow == COLOR_WORKFLOW_BASIC:
             self.ocio_color_spaces = []
             self.ocio_status = "Basic workflow uses built-in transforms"
             return
-        self.ocio_color_spaces, self.ocio_status = _load_ocio_color_spaces(self.ocio_config_path)
+        if self.color_workflow == COLOR_WORKFLOW_BUILTIN_OCIO:
+            config = _builtin_ocio_config(self.builtin_ocio_config)
+            self.ocio_color_spaces, status = _load_ocio_color_spaces(_builtin_ocio_config_path(config.id))
+            self.ocio_status = f"{config.label}: {status}"
+            return
+        if self.color_workflow == COLOR_WORKFLOW_OCIO:
+            self.ocio_color_spaces, self.ocio_status = _load_ocio_color_spaces(self.ocio_config_path)
+            return
+        self.color_workflow = COLOR_WORKFLOW_BASIC
+        self.ocio_color_spaces = []
+        self.ocio_status = "Basic workflow uses built-in transforms"
 
     def ocio_workflow_is_active(self) -> bool:
-        return self.color_workflow == COLOR_WORKFLOW_OCIO and bool(self.ocio_color_spaces)
+        return self.color_workflow in {COLOR_WORKFLOW_BUILTIN_OCIO, COLOR_WORKFLOW_OCIO} and bool(self.ocio_color_spaces)
+
+    def active_ocio_config_path(self) -> str:
+        if self.color_workflow == COLOR_WORKFLOW_BUILTIN_OCIO:
+            return _builtin_ocio_config_path(self.builtin_ocio_config)
+        if self.color_workflow == COLOR_WORKFLOW_OCIO:
+            return self.ocio_config_path
+        return ""
 
     def open_preferences(self) -> None:
         dialog = PreferencesDialog(
             self,
             workflow=self.color_workflow,
             ocio_config_path=self.ocio_config_path,
+            builtin_ocio_config=self.builtin_ocio_config,
             ocio_status=self.ocio_status,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        self.apply_color_preferences(dialog.selected_workflow(), dialog.selected_ocio_config_path())
+        self.apply_color_preferences(
+            dialog.selected_workflow(),
+            dialog.selected_ocio_config_path(),
+            dialog.selected_builtin_ocio_config(),
+        )
 
-    def apply_color_preferences(self, workflow: str, ocio_config_path: str) -> None:
-        self.color_workflow = workflow if workflow in {COLOR_WORKFLOW_BASIC, COLOR_WORKFLOW_OCIO} else COLOR_WORKFLOW_BASIC
+    def apply_color_preferences(
+        self,
+        workflow: str,
+        ocio_config_path: str,
+        builtin_ocio_config: str | None = None,
+    ) -> None:
+        valid_workflows = {COLOR_WORKFLOW_BASIC, COLOR_WORKFLOW_BUILTIN_OCIO, COLOR_WORKFLOW_OCIO}
+        self.color_workflow = workflow if workflow in valid_workflows else COLOR_WORKFLOW_BASIC
         self.ocio_config_path = ocio_config_path
+        if builtin_ocio_config:
+            self.builtin_ocio_config = builtin_ocio_config
         self.settings.setValue("color/workflow", self.color_workflow)
         self.settings.setValue("ocio/config_path", self.ocio_config_path)
+        self.settings.setValue("ocio/builtin_config", self.builtin_ocio_config)
         self.reload_ocio_config()
         self.refresh_color_transform_options()
         self.refresh_color_transform_defaults()
@@ -839,16 +1128,24 @@ class MainWindow(QMainWindow):
 
         input_row = QGridLayout()
         self.input_edit = QLineEdit()
+        self.input_edit.textChanged.connect(lambda _text: self.schedule_manual_input_refresh())
         self.input_range_edit = QLineEdit()
         self.input_range_edit.setReadOnly(True)
         self.input_range_edit.setPlaceholderText("No sequence range selected")
         self.input_browse_button = QPushButton("Browse")
         self.input_browse_button.clicked.connect(self.browse_input)
+        self.audio_input_edit = QLineEdit()
+        self.audio_input_edit.textChanged.connect(lambda _text: self.refresh_audio_controls())
+        self.audio_input_browse_button = QPushButton("Browse")
+        self.audio_input_browse_button.clicked.connect(self.browse_audio_input)
         input_row.addWidget(QLabel("Input"), 0, 0)
         input_row.addWidget(self.input_edit, 0, 1)
         input_row.addWidget(self.input_browse_button, 0, 2)
         input_row.addWidget(QLabel("Range"), 1, 0)
         input_row.addWidget(self.input_range_edit, 1, 1, 1, 2)
+        input_row.addWidget(QLabel("Audio Input"), 2, 0)
+        input_row.addWidget(self.audio_input_edit, 2, 1)
+        input_row.addWidget(self.audio_input_browse_button, 2, 2)
         root.addLayout(input_row)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -946,6 +1243,53 @@ class MainWindow(QMainWindow):
         group = QGroupBox("Conversion Settings")
         layout = QFormLayout(group)
 
+        geometry_group = QGroupBox("Image")
+        geometry_layout = QFormLayout(geometry_group)
+
+        self.scale_label = QLabel("1.000")
+        scale_row = QHBoxLayout()
+        self.scale_slider = QSlider(Qt.Orientation.Horizontal)
+        self.scale_slider.setRange(0, 2000)
+        self.scale_slider.setValue(1000)
+        self.scale_slider.valueChanged.connect(self.handle_scale_slider_changed)
+        self.scale_label.setMinimumWidth(44)
+        scale_row.addWidget(self.scale_slider, stretch=1)
+        scale_row.addWidget(self.scale_label)
+        geometry_layout.addRow("Scale", scale_row)
+
+        size_row = QHBoxLayout()
+        self.output_width_spin = QSpinBox()
+        self.output_width_spin.setRange(1, 99999)
+        self.output_width_spin.setSuffix(" px")
+        self.output_width_spin.valueChanged.connect(self.handle_output_width_changed)
+        self.output_height_spin = QSpinBox()
+        self.output_height_spin.setRange(1, 99999)
+        self.output_height_spin.setSuffix(" px")
+        self.output_height_spin.valueChanged.connect(self.handle_output_height_changed)
+        size_row.addWidget(self.output_width_spin)
+        size_row.addWidget(QLabel("x"))
+        size_row.addWidget(self.output_height_spin)
+        geometry_layout.addRow("Output Size", size_row)
+
+        self.preview_pixel_aspect_combo = QComboBox()
+        self.preview_pixel_aspect_combo.addItem("Auto", PIXEL_ASPECT_AUTO)
+        self.preview_pixel_aspect_combo.addItem("Manual", PIXEL_ASPECT_MANUAL)
+        self.preview_pixel_aspect_combo.currentIndexChanged.connect(lambda _index: self.refresh_pixel_aspect_controls())
+        geometry_layout.addRow("Pixel Aspect", self.preview_pixel_aspect_combo)
+
+        self.manual_pixel_aspect_edit = QLineEdit("1.0")
+        self.manual_pixel_aspect_edit.setPlaceholderText("1.0")
+        self.manual_pixel_aspect_edit.textChanged.connect(self.handle_manual_pixel_aspect_changed)
+        self.manual_pixel_aspect_edit.editingFinished.connect(self.handle_manual_pixel_aspect_changed)
+        geometry_layout.addRow("Manual PAR", self.manual_pixel_aspect_edit)
+
+        self.anamorph_output_combo = QComboBox()
+        self.anamorph_output_combo.addItem("Keep Original Pixels", ANAMORPH_OUTPUT_PRESERVE)
+        self.anamorph_output_combo.addItem("Resize to Square Pixels", ANAMORPH_OUTPUT_BAKE)
+        self.anamorph_output_combo.currentIndexChanged.connect(lambda _index: self.refresh_scale_controls())
+        geometry_layout.addRow("Pixel Aspect Output", self.anamorph_output_combo)
+        layout.addRow(geometry_group)
+
         self.file_type_combo = QComboBox()
         for key, option in OUTPUT_OPTIONS.items():
             self.file_type_combo.addItem(option["label"], key)
@@ -959,11 +1303,28 @@ class MainWindow(QMainWindow):
         self.fps_label = QLabel("FPS")
         self.fps_edit = QLineEdit("24")
         self.fps_edit.setPlaceholderText("24")
+        self.fps_edit.textChanged.connect(lambda _text: self.refresh_media_info_summary())
         layout.addRow(self.fps_label, self.fps_edit)
 
         self.codec_profile_label = QLabel("Codec Profile")
         self.codec_profile_combo = QComboBox()
         layout.addRow(self.codec_profile_label, self.codec_profile_combo)
+
+        self.audio_group = QGroupBox("Audio")
+        audio_layout = QFormLayout(self.audio_group)
+        self.audio_format_combo = QComboBox()
+        for file_type in ("wav", "mp3", "aac"):
+            self.audio_format_combo.addItem(OUTPUT_OPTIONS[file_type]["label"], file_type)
+        self.audio_format_combo.setCurrentIndex(self.audio_format_combo.findData("aac"))
+        self.audio_format_combo.currentIndexChanged.connect(lambda _index: self.refresh_external_audio_profile_controls())
+        audio_layout.addRow("Audio Format", self.audio_format_combo)
+        self.audio_profile_label = QLabel("Audio Profile")
+        self.audio_profile_combo = QComboBox()
+        audio_layout.addRow(self.audio_profile_label, self.audio_profile_combo)
+        self.copy_video_add_audio_check = QCheckBox("Add Audio Without Re-encoding Video")
+        self.copy_video_add_audio_check.toggled.connect(lambda _checked: self.refresh_video_copy_audio_controls())
+        audio_layout.addRow("", self.copy_video_add_audio_check)
+        layout.addRow(self.audio_group)
 
         self.jpg_quality_label = QLabel("JPG Quality")
         quality_row = QHBoxLayout()
@@ -980,11 +1341,13 @@ class MainWindow(QMainWindow):
         self.input_transform_combo = QComboBox()
         self.output_transform_combo = QComboBox()
         self.input_transform_combo.currentIndexChanged.connect(lambda _index: self.refresh_preview_display_transform())
+        self.output_transform_combo.currentIndexChanged.connect(lambda _index: self.refresh_media_info_summary())
         layout.addRow("Input Transform", self.input_transform_combo)
         layout.addRow("Output Transform", self.output_transform_combo)
         self.refresh_color_transform_options()
 
         self.output_edit = QLineEdit()
+        self.output_edit.textEdited.connect(lambda _text: self.mark_output_path_manual())
         output_row = QHBoxLayout()
         output_row.addWidget(self.output_edit)
         output_button = QPushButton("Browse")
@@ -998,18 +1361,29 @@ class MainWindow(QMainWindow):
         self.summary_text = QPlainTextEdit()
         self.summary_text.setReadOnly(True)
         self.summary_text.setMinimumHeight(180)
-        layout.addRow("Summary", self.summary_text)
+        layout.addRow("Media Info", self.summary_text)
 
         self.refresh_output_controls()
+        self.refresh_pixel_aspect_controls()
         return group
 
     def _build_media_info_tab(self) -> None:
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        self.media_info_text = QPlainTextEdit()
-        self.media_info_text.setReadOnly(True)
-        layout.addWidget(self.media_info_text)
-        self.tabs.addTab(tab, "Media Info")
+        self.metadata_table = MetadataTable(0, 2)
+        self.metadata_table.setHorizontalHeaderLabels(["Key", "Value"])
+        self.metadata_table.horizontalHeader().setStretchLastSection(True)
+        self.metadata_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.metadata_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.metadata_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        layout.addWidget(self.metadata_table)
+        search_row = QHBoxLayout()
+        search_row.addWidget(QLabel("Search metadata for"))
+        self.metadata_search_edit = QLineEdit()
+        self.metadata_search_edit.textChanged.connect(self.filter_metadata_table)
+        search_row.addWidget(self.metadata_search_edit, stretch=1)
+        layout.addLayout(search_row)
+        self.tabs.addTab(tab, "Metadata")
 
     def _build_queue_tab(self) -> None:
         tab = QWidget()
@@ -1024,6 +1398,7 @@ class MainWindow(QMainWindow):
         tab = QWidget()
         layout = QVBoxLayout(tab)
         self.log_text = QPlainTextEdit()
+        self.log_text.setObjectName("logText")
         self.log_text.setReadOnly(True)
         layout.addWidget(self.log_text)
         self.tabs.addTab(tab, "Logs")
@@ -1032,7 +1407,10 @@ class MainWindow(QMainWindow):
         selected = SequenceFileDialog.get_input(self, self._input_dialog_start_dir())
         if not selected:
             return
+        self.input_edit_refresh_timer.stop()
+        self.input_edit.blockSignals(True)
         self.input_edit.setText(str(selected.input_path))
+        self.input_edit.blockSignals(False)
         self.current_input_is_sequence = selected.is_sequence
         self.current_input_sequence_start = selected.sequence_start
         self.current_input_sequence_end = selected.sequence_end
@@ -1041,17 +1419,78 @@ class MainWindow(QMainWindow):
         self.current_input_sequence_end_text = selected.sequence_end_text
         self.input_range_edit.setText(self._selected_range_text())
         self._prepare_preview_source(selected.preview_path, selected.is_sequence)
-        self.output_edit.setText(_default_output_path(
-            selected.input_path,
-            self.current_preset(),
-            sequence_start=selected.sequence_start,
-            sequence_end=selected.sequence_end,
-            sequence_start_text=selected.sequence_start_text,
-            sequence_end_text=selected.sequence_end_text,
-        ))
+        if not self.output_path_is_manual or not self.output_edit.text().strip():
+            self.output_edit.setText(_default_output_path(
+                selected.input_path,
+                self.current_preset(),
+                sequence_start=selected.sequence_start,
+                sequence_end=selected.sequence_end,
+                sequence_start_text=selected.sequence_start_text,
+                sequence_end_text=selected.sequence_end_text,
+            ))
         self.refresh_color_transform_defaults()
         self.refresh_fps_control_visibility()
         self.probe_input(selected.preview_path)
+
+    def browse_audio_input(self) -> None:
+        current = self.audio_input_edit.text().strip()
+        start_path = Path(current).expanduser().parent if current else Path.home()
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Choose audio input",
+            str(start_path),
+            "Audio files (*.wav *.mp3 *.aac *.m4a *.flac *.ogg);;All files (*)",
+        )
+        if path:
+            self.audio_input_edit.setText(path)
+
+    def schedule_manual_input_refresh(self) -> None:
+        self.input_edit_refresh_timer.start(120)
+
+    def mark_output_path_manual(self) -> None:
+        self.output_path_is_manual = bool(self.output_edit.text().strip())
+
+    def refresh_from_manual_input_path(self) -> None:
+        input_text = self.input_edit.text().strip()
+        if not input_text:
+            return
+        input_path = Path(input_text).expanduser()
+        sequence_start = sequence_start_number(input_path)
+        frames = sequence_frames(input_path) if sequence_start is not None else []
+        sequence_end = None
+        sequence_start_text = None
+        sequence_end_text = None
+        if frames:
+            start_match = split_sequence_name(frames[0].name)
+            end_match = split_sequence_name(frames[-1].name)
+            if start_match and end_match:
+                sequence_start = int(start_match[1])
+                sequence_end = int(end_match[1])
+                sequence_start_text = start_match[1]
+                sequence_end_text = end_match[1]
+
+        self.current_input_is_sequence = sequence_start is not None
+        self.current_input_sequence_start = sequence_start
+        self.current_input_sequence_end = sequence_end
+        self.current_input_sequence_frame_count = len(frames) if frames else None
+        self.current_input_sequence_start_text = sequence_start_text
+        self.current_input_sequence_end_text = sequence_end_text
+        self.input_range_edit.setText(self._selected_range_text())
+        self.refresh_color_transform_defaults()
+        self.refresh_fps_control_visibility()
+        if not self.output_path_is_manual or not self.output_edit.text().strip():
+            self.output_edit.setText(_default_output_path(
+                input_path,
+                self.current_preset(),
+                sequence_start=sequence_start,
+                sequence_end=sequence_end,
+                sequence_start_text=sequence_start_text,
+                sequence_end_text=sequence_end_text,
+            ))
+        preview_path = frames[0] if frames else input_path
+        if preview_path.exists():
+            self._prepare_preview_source(preview_path, is_sequence=bool(frames))
+            self.probe_input(preview_path)
 
     def _selected_range_text(self) -> str:
         if not self.current_input_is_sequence:
@@ -1075,6 +1514,7 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(self, "Choose output file")
         if path:
             self.output_edit.setText(path)
+            self.output_path_is_manual = True
 
     def probe_input(self, input_path: Path | None = None) -> None:
         input_path = input_path or Path(self.input_edit.text()).expanduser()
@@ -1084,17 +1524,56 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Analyze failed", str(exc))
             return
 
-        raw = json.dumps(self.current_probe_json, indent=2, ensure_ascii=False)
         self.current_fps = _fps_from_probe(self.current_probe_json) or self.current_fps
-        self.media_info_text.setPlainText(raw)
+        self.update_source_raster_size(_video_size_from_probe(self.current_probe_json))
+        self.refresh_media_info_summary()
+        self.refresh_metadata_table(input_path)
+        self._sync_video_timeline_from_probe()
+        self.tabs.setCurrentIndex(0)
+
+    def refresh_media_info_summary(self) -> None:
+        if not hasattr(self, "summary_text") or self.current_probe_json is None:
+            return
         self.summary_text.setPlainText(_media_summary(
             self.current_probe_json,
             input_path=Path(self.input_edit.text()).expanduser(),
             fps=self.current_fps,
             sequence_frame_count=self.current_input_sequence_frame_count,
+            output_resolution=self.selected_output_raster_size(),
+            output_codec=self.selected_output_codec_label(),
+            output_color_space=self.selected_output_transform_label(),
         ))
-        self._sync_video_timeline_from_probe()
-        self.tabs.setCurrentIndex(0)
+
+    def refresh_metadata_table(self, input_path: Path | None = None) -> None:
+        if not hasattr(self, "metadata_table") or self.current_probe_json is None:
+            return
+        rows = _metadata_rows(
+            self.current_probe_json,
+            input_path or Path(self.input_edit.text()).expanduser(),
+        )
+        self.metadata_table.setRowCount(len(rows))
+        for row_index, (source, group, key, value) in enumerate(rows):
+            key_item = QTableWidgetItem(_metadata_display_key(source, group, key))
+            key_item.setData(Qt.ItemDataRole.UserRole, _metadata_full_key(source, group, key))
+            self.metadata_table.setItem(row_index, 0, key_item)
+            self.metadata_table.setItem(row_index, 1, QTableWidgetItem(value))
+        self.metadata_table.resizeColumnsToContents()
+        self.filter_metadata_table()
+
+    def filter_metadata_table(self) -> None:
+        if not hasattr(self, "metadata_table") or not hasattr(self, "metadata_search_edit"):
+            return
+        needle = self.metadata_search_edit.text().strip().casefold()
+        for row in range(self.metadata_table.rowCount()):
+            key_item = self.metadata_table.item(row, 0)
+            value_item = self.metadata_table.item(row, 1)
+            full_key = key_item.data(Qt.ItemDataRole.UserRole) if key_item else ""
+            haystack = " ".join((
+                key_item.text() if key_item else "",
+                str(full_key or ""),
+                value_item.text() if value_item else "",
+            )).casefold()
+            self.metadata_table.setRowHidden(row, bool(needle and needle not in haystack))
 
     def _sync_video_timeline_from_probe(self) -> None:
         if self.preview_is_sequence or self.sequence_preview_frames or not self.preview_source_path:
@@ -1125,6 +1604,10 @@ class MainWindow(QMainWindow):
         self.refresh_jpg_quality_visibility()
         self.refresh_output_path_extension()
         self.refresh_color_transform_defaults()
+        self.refresh_scale_controls()
+        self.refresh_audio_controls()
+        self.refresh_video_copy_audio_controls()
+        self.refresh_media_info_summary()
 
     def refresh_profile_controls(self) -> None:
         file_type = self.selected_file_type()
@@ -1144,13 +1627,74 @@ class MainWindow(QMainWindow):
         default_profile = previous_profile if previous_profile in codec_option["profiles"] else codec_option["default_profile"]
         self.codec_profile_combo.setCurrentIndex(max(self.codec_profile_combo.findData(default_profile), 0))
         self.codec_profile_combo.blockSignals(False)
+        self.refresh_video_copy_audio_controls()
+        self.refresh_media_info_summary()
+
+    def refresh_audio_controls(self) -> None:
+        if not hasattr(self, "audio_group"):
+            return
+        has_audio_input = self.external_audio_enabled()
+        self.audio_group.setVisible(has_audio_input)
+        self.audio_group.setEnabled(has_audio_input)
+        if has_audio_input and self.audio_profile_combo.count() == 0:
+            self.refresh_external_audio_profile_controls()
+        self.copy_video_add_audio_check.setVisible(self.selected_file_type() == "mp4")
+        self.copy_video_add_audio_check.setEnabled(has_audio_input and self.selected_file_type() == "mp4")
+        if not has_audio_input or self.selected_file_type() != "mp4":
+            self.copy_video_add_audio_check.blockSignals(True)
+            self.copy_video_add_audio_check.setChecked(False)
+            self.copy_video_add_audio_check.blockSignals(False)
+        self.refresh_video_copy_audio_controls()
+
+    def refresh_external_audio_profile_controls(self) -> None:
+        if not hasattr(self, "audio_profile_combo"):
+            return
+        file_type = self.selected_external_audio_format()
+        option = OUTPUT_OPTIONS[file_type]
+        codec_key = option["default_codec"]
+        codec_option = option["codecs"][codec_key]
+        previous_profile = self.audio_profile_combo.currentData()
+
+        self.audio_profile_combo.blockSignals(True)
+        self.audio_profile_combo.clear()
+        self.audio_profile_label.setText(codec_option.get("profile_label", "Audio Profile"))
+        for profile_key, profile_option in codec_option["profiles"].items():
+            self.audio_profile_combo.addItem(profile_option["label"], profile_key)
+        default_profile = previous_profile if previous_profile in codec_option["profiles"] else codec_option["default_profile"]
+        self.audio_profile_combo.setCurrentIndex(max(self.audio_profile_combo.findData(default_profile), 0))
+        self.audio_profile_combo.blockSignals(False)
+        self.refresh_media_info_summary()
+
+    def refresh_video_copy_audio_controls(self) -> None:
+        if not hasattr(self, "copy_video_add_audio_check"):
+            return
+        mux_mode = self.video_copy_audio_mux_enabled()
+        for widget in (
+            self.codec_combo,
+            self.codec_profile_combo,
+            self.input_transform_combo,
+            self.output_transform_combo,
+            self.preview_pixel_aspect_combo,
+            self.anamorph_output_combo,
+            self.jpg_quality_slider,
+        ):
+            widget.setEnabled(not mux_mode)
+        self.jpg_quality_label.setEnabled(not mux_mode)
+        self.jpg_quality_value_label.setEnabled(not mux_mode)
+        self.refresh_fps_control_visibility()
+        self.refresh_pixel_aspect_controls()
+        self.refresh_scale_controls()
+        self.refresh_media_info_summary()
 
     def refresh_output_path_extension(self) -> None:
         if not self.input_edit.text().strip():
             return
         current_output = self.output_edit.text().strip()
         if not current_output:
+            self.output_path_is_manual = False
             self.output_edit.setText(_default_output_path(Path(self.input_edit.text()), self.current_preset()))
+            return
+        if self.output_path_is_manual:
             return
         output_path = Path(current_output)
         extension = self.current_preset().output.get("extension", output_path.suffix.lstrip("."))
@@ -1183,11 +1727,55 @@ class MainWindow(QMainWindow):
     def selected_profile(self) -> str:
         return str(self.codec_profile_combo.currentData())
 
+    def external_audio_enabled(self) -> bool:
+        return bool(hasattr(self, "audio_input_edit") and self.audio_input_edit.text().strip())
+
+    def selected_external_audio_format(self) -> str:
+        return str(self.audio_format_combo.currentData() or "aac")
+
+    def selected_external_audio_profile(self) -> str:
+        return str(self.audio_profile_combo.currentData())
+
+    def video_copy_audio_mux_enabled(self) -> bool:
+        return (
+            hasattr(self, "copy_video_add_audio_check")
+            and self.selected_file_type() == "mp4"
+            and self.external_audio_enabled()
+            and self.copy_video_add_audio_check.isChecked()
+        )
+
+    def selected_external_audio_settings(self) -> dict:
+        file_type = self.selected_external_audio_format()
+        option = OUTPUT_OPTIONS[file_type]
+        codec_key = option["default_codec"]
+        codec_option = option["codecs"][codec_key]
+        profile_key = self.selected_external_audio_profile() or codec_option["default_profile"]
+        profile_option = codec_option["profiles"].get(profile_key) or codec_option["profiles"][codec_option["default_profile"]]
+        audio = deepcopy(get_preset(codec_option["preset"]).audio)
+        if "audio_codec" in profile_option:
+            audio["codec"] = profile_option["audio_codec"]
+        if "sample_rate" in profile_option:
+            audio["sample_rate"] = profile_option["sample_rate"]
+        if "bitrate" in profile_option:
+            audio["bitrate"] = profile_option["bitrate"]
+        audio["shortest"] = True
+        return audio
+
     def selected_input_transform(self) -> str:
         return str(self.input_transform_combo.currentData())
 
     def selected_output_transform(self) -> str:
         return str(self.output_transform_combo.currentData())
+
+    def selected_output_transform_label(self) -> str:
+        return self.output_transform_combo.currentText() or self.selected_output_transform()
+
+    def selected_output_codec_label(self) -> str:
+        codec = self.codec_combo.currentText()
+        profile = self.codec_profile_combo.currentText()
+        if codec and profile:
+            return f"{codec} / {profile}"
+        return codec or profile or "unknown"
 
     def refresh_color_transform_options(self) -> None:
         previous_input = self.input_transform_combo.currentData()
@@ -1218,12 +1806,33 @@ class MainWindow(QMainWindow):
 
     def refresh_color_transform_defaults(self) -> None:
         if self.ocio_workflow_is_active():
+            input_path = Path(self.input_edit.text()).expanduser() if self.input_edit.text().strip() else None
+            input_default = self._default_ocio_input_color_space(input_path)
+            output_default = self._default_ocio_output_color_space(self.selected_file_type())
+            self._set_combo_data(self.input_transform_combo, input_default)
+            self._set_combo_data(self.output_transform_combo, output_default)
             return
         input_path = Path(self.input_edit.text()).expanduser() if self.input_edit.text().strip() else None
         input_default = _default_input_color_space(input_path)
         output_default = OUTPUT_COLOR_DEFAULT_BY_FILE_TYPE.get(self.selected_file_type(), "none")
         self._set_combo_data(self.input_transform_combo, input_default)
         self._set_combo_data(self.output_transform_combo, output_default)
+
+    def _default_ocio_input_color_space(self, input_path: Path | None) -> str:
+        if self.color_workflow == COLOR_WORKFLOW_BUILTIN_OCIO:
+            config = _builtin_ocio_config(self.builtin_ocio_config)
+            name = config.default_input_by_extension.get(input_path.suffix.lower() if input_path else "", "sRGB")
+            return f"ocio:{name}"
+        current = self.input_transform_combo.currentData()
+        return str(current) if current else f"ocio:{self.ocio_color_spaces[0]}"
+
+    def _default_ocio_output_color_space(self, file_type: str) -> str:
+        if self.color_workflow == COLOR_WORKFLOW_BUILTIN_OCIO:
+            config = _builtin_ocio_config(self.builtin_ocio_config)
+            name = config.default_output_by_file_type.get(file_type, "sRGB")
+            return f"ocio:{name}"
+        current = self.output_transform_combo.currentData()
+        return str(current) if current else f"ocio:{self.ocio_color_spaces[0]}"
 
     def _set_combo_data(self, combo: QComboBox, value: str) -> None:
         index = combo.findData(value)
@@ -1245,6 +1854,8 @@ class MainWindow(QMainWindow):
 
         output["extension"] = OUTPUT_OPTIONS[file_type]["extension"]
 
+        if "video" in codec_option:
+            video.update(deepcopy(codec_option["video"]))
         if "profile" in profile_option:
             if profile_option["profile"] is None:
                 video.pop("profile", None)
@@ -1256,12 +1867,42 @@ class MainWindow(QMainWindow):
             video["compression"] = profile_option["compression"]
         if "quality" in profile_option:
             video["quality"] = profile_option["quality"]
+        if "encoder_options" in profile_option:
+            video["encoder_options"] = deepcopy(profile_option["encoder_options"])
         if file_type == "jpg":
             video["quality"] = _jpeg_quality_percent_to_qscale(self.jpg_quality_slider.value())
         if "audio_codec" in profile_option:
             audio["codec"] = profile_option["audio_codec"]
+        if "sample_rate" in profile_option:
+            audio["sample_rate"] = profile_option["sample_rate"]
+        if "bitrate" in profile_option:
+            audio["bitrate"] = profile_option["bitrate"]
+
+        external_audio = self.external_audio_enabled()
+        mux_without_video_encode = self.video_copy_audio_mux_enabled()
+        if external_audio:
+            audio = self.selected_external_audio_settings()
+        if mux_without_video_encode:
+            video = {"enabled": True, "codec": "copy"}
+            filters = {
+                "scale": "keep",
+                "fps": "source",
+                "force_even_dimensions": False,
+                "copy_video_with_external_audio": True,
+            }
+            return Preset(
+                id=f"{file_type}_copy_video_add_audio_{self.selected_external_audio_format()}",
+                name=f"{OUTPUT_OPTIONS[file_type]['label']} / Copy Video + {self.audio_format_combo.currentText()} Audio",
+                group=preset.group,
+                output=output,
+                video=video,
+                audio=audio,
+                filters=filters,
+            )
+
         selected_input_transform = self.selected_input_transform()
         selected_output_transform = self.selected_output_transform()
+        video.update(_video_color_metadata_for_output_transform(selected_output_transform, file_type))
         filters["input_color_space"] = _command_color_space_value(selected_input_transform)
         filters["output_color_space"] = _command_color_space_value(selected_output_transform)
         ocio_input_color_space = _ocio_color_space_name(selected_input_transform)
@@ -1273,7 +1914,7 @@ class MainWindow(QMainWindow):
         ocio_lut = _ocio_lut_path(
             selected_input_transform,
             selected_output_transform,
-            self.ocio_config_path,
+            self.active_ocio_config_path(),
         )
         if ocio_lut:
             filters["lut3d"] = str(ocio_lut)
@@ -1283,6 +1924,18 @@ class MainWindow(QMainWindow):
         if self.should_show_fps_control():
             fps = _parse_positive_float(self.fps_edit.text())
             filters["fps"] = fps if fps else "source"
+        pixel_aspect = self.selected_pixel_aspect_for_path(self._current_preview_frame_path())
+        filters["output_pixel_aspect"] = pixel_aspect
+        filters["anamorph_output"] = self.selected_anamorph_output_mode()
+        filters["preserve_pixel_aspect"] = self.selected_anamorph_output_mode() == ANAMORPH_OUTPUT_PRESERVE
+        target_size = self.selected_output_raster_size()
+        base_size = self.base_output_raster_size()
+        if target_size and base_size and target_size != base_size:
+            filters["scale"] = {
+                "mode": "dimensions",
+                "width": target_size.width(),
+                "height": target_size.height(),
+            }
 
         return Preset(
             id=f"{file_type}_{codec}_{profile}",
@@ -1311,12 +1964,149 @@ class MainWindow(QMainWindow):
         show_fps = self.should_show_fps_control()
         self.fps_label.setVisible(show_fps)
         self.fps_edit.setVisible(show_fps)
+        enabled = show_fps and not self.video_copy_audio_mux_enabled()
+        self.fps_label.setEnabled(enabled)
+        self.fps_edit.setEnabled(enabled)
 
     def refresh_jpg_quality_visibility(self) -> None:
         show_quality = self.selected_file_type() == "jpg"
         self.jpg_quality_label.setVisible(show_quality)
         self.jpg_quality_slider.setVisible(show_quality)
         self.jpg_quality_value_label.setVisible(show_quality)
+        enabled = show_quality and not self.video_copy_audio_mux_enabled()
+        self.jpg_quality_label.setEnabled(enabled)
+        self.jpg_quality_slider.setEnabled(enabled)
+        self.jpg_quality_value_label.setEnabled(enabled)
+
+    def refresh_scale_controls(self) -> None:
+        if not hasattr(self, "scale_slider"):
+            return
+        base_size = self.base_output_raster_size()
+        enabled = base_size is not None and not self.video_copy_audio_mux_enabled()
+        for widget in (self.scale_slider, self.output_width_spin, self.output_height_spin):
+            widget.setEnabled(enabled)
+        if not enabled:
+            self.scale_label.setText("1.000")
+            return
+        self._set_output_size_from_scale(self.scale_slider.value() / 1000)
+
+    def handle_scale_slider_changed(self, value: int) -> None:
+        if self._updating_scale_controls:
+            return
+        self._set_output_size_from_scale(value / 1000)
+
+    def handle_output_width_changed(self, value: int) -> None:
+        if self._updating_scale_controls:
+            return
+        base_size = self.base_output_raster_size()
+        if not base_size:
+            return
+        multiple = self.output_dimension_multiple()
+        width = _rounded_output_dimension(value, multiple)
+        scale = width / base_size.width()
+        height = _rounded_output_dimension(width * base_size.height() / base_size.width(), multiple)
+        self._set_scale_controls(width, height, scale)
+
+    def handle_output_height_changed(self, value: int) -> None:
+        if self._updating_scale_controls:
+            return
+        base_size = self.base_output_raster_size()
+        if not base_size:
+            return
+        multiple = self.output_dimension_multiple()
+        height = _rounded_output_dimension(value, multiple)
+        scale = height / base_size.height()
+        width = _rounded_output_dimension(height * base_size.width() / base_size.height(), multiple)
+        self._set_scale_controls(width, height, scale)
+
+    def _set_output_size_from_scale(self, scale: float) -> None:
+        base_size = self.base_output_raster_size()
+        if not base_size:
+            return
+        multiple = self.output_dimension_multiple()
+        width = _rounded_output_dimension(base_size.width() * scale, multiple)
+        height = _rounded_output_dimension(base_size.height() * scale, multiple)
+        self._set_scale_controls(width, height, scale)
+
+    def _set_scale_controls(self, width: int, height: int, scale: float) -> None:
+        self._updating_scale_controls = True
+        try:
+            self.output_width_spin.setValue(width)
+            self.output_height_spin.setValue(height)
+            slider_value = max(self.scale_slider.minimum(), min(self.scale_slider.maximum(), round(scale * 1000)))
+            self.scale_slider.setValue(slider_value)
+            self.scale_label.setText(f"{slider_value / 1000:.3f}")
+        finally:
+            self._updating_scale_controls = False
+        self.refresh_media_info_summary()
+
+    def selected_output_raster_size(self) -> QSize | None:
+        if not self.base_output_raster_size():
+            return None
+        return QSize(self.output_width_spin.value(), self.output_height_spin.value())
+
+    def base_output_raster_size(self) -> QSize | None:
+        if not self.current_source_raster_size:
+            return None
+        width = self.current_source_raster_size.width()
+        height = self.current_source_raster_size.height()
+        if width <= 0 or height <= 0:
+            return None
+        if self.selected_anamorph_output_mode() == ANAMORPH_OUTPUT_BAKE:
+            pixel_aspect = self.selected_pixel_aspect_for_path(self._current_preview_frame_path())
+            width = _rounded_output_dimension(width * pixel_aspect, 1)
+        return QSize(width, height)
+
+    def output_dimension_multiple(self) -> int:
+        return 8 if self.selected_file_type() == "mp4" else 1
+
+    def update_source_raster_size(self, size: QSize | None) -> None:
+        if size is None or size.width() <= 0 or size.height() <= 0:
+            return
+        if self.current_source_raster_size == size:
+            return
+        self.current_source_raster_size = QSize(size)
+        self.refresh_scale_controls()
+
+    def refresh_pixel_aspect_controls(self) -> None:
+        controls_enabled = not self.video_copy_audio_mux_enabled()
+        manual = controls_enabled and self.selected_preview_pixel_aspect_mode() == PIXEL_ASPECT_MANUAL
+        self.preview_pixel_aspect_combo.setEnabled(controls_enabled)
+        self.anamorph_output_combo.setEnabled(controls_enabled)
+        self.manual_pixel_aspect_edit.setEnabled(manual)
+        if not manual:
+            self._set_pixel_aspect_edit_value(self.selected_pixel_aspect_for_path(self._current_preview_frame_path()))
+        self.refresh_preview_display_transform()
+        self.refresh_scale_controls()
+
+    def handle_manual_pixel_aspect_changed(self) -> None:
+        self.refresh_preview_display_transform()
+        self.refresh_scale_controls()
+
+    def selected_preview_pixel_aspect_mode(self) -> str:
+        return str(self.preview_pixel_aspect_combo.currentData())
+
+    def selected_anamorph_output_mode(self) -> str:
+        return str(self.anamorph_output_combo.currentData())
+
+    def selected_pixel_aspect_for_path(self, path: Path | None) -> float:
+        if self.selected_preview_pixel_aspect_mode() == PIXEL_ASPECT_MANUAL:
+            return _normalized_pixel_aspect(_parse_positive_float(self.manual_pixel_aspect_edit.text()) or 1.0)
+        return _pixel_aspect_for_path(path)
+
+    def _sync_auto_pixel_aspect_edit(self, path: Path | None) -> None:
+        if self.selected_preview_pixel_aspect_mode() == PIXEL_ASPECT_AUTO:
+            self._set_pixel_aspect_edit_value(self.selected_pixel_aspect_for_path(path))
+
+    def _set_pixel_aspect_edit_value(self, value: float) -> None:
+        self.manual_pixel_aspect_edit.blockSignals(True)
+        self.manual_pixel_aspect_edit.setText(_format_pixel_aspect(value))
+        self.manual_pixel_aspect_edit.blockSignals(False)
+
+    def _current_preview_frame_path(self) -> Path | None:
+        if self.sequence_preview_frames:
+            return self.sequence_preview_frames[max(0, min(self.sequence_frame_index, len(self.sequence_preview_frames) - 1))]
+        return self.preview_source_path
 
     def build_job(self) -> ConvertJob:
         input_path = Path(self.input_edit.text()).expanduser()
@@ -1336,6 +2126,7 @@ class MainWindow(QMainWindow):
             input=input_path,
             output=output_path,
             preset=preset,
+            audio_input=Path(self.audio_input_edit.text()).expanduser() if self.external_audio_enabled() else None,
             input_start_number=input_start_number,
             output_start_number=self._output_sequence_start_number(preset, input_start_number),
             in_point=in_point,
@@ -1377,6 +2168,11 @@ class MainWindow(QMainWindow):
     def convert_now(self) -> None:
         try:
             job = self.build_job()
+            if output_exists_for_job(job) and not job.overwrite:
+                if not self.confirm_overwrite(job):
+                    self.progress_label.setText("Cancelled")
+                    return
+                job = replace(job, overwrite=True)
             build_ffmpeg_args(job)
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "Convert failed", str(exc))
@@ -1398,6 +2194,20 @@ class MainWindow(QMainWindow):
         self.current_worker.finished_with_code.connect(lambda code: self._conversion_finished(row, code))
         self.current_worker.failed.connect(lambda message: self._conversion_failed(row, message))
         self.current_worker.start()
+
+    def confirm_overwrite(self, job: ConvertJob) -> bool:
+        if "%" in job.output.name:
+            message = f"Output sequence frames already exist:\n{job.output}\n\nOverwrite?"
+        else:
+            message = f"Output file already exists:\n{job.output}\n\nOverwrite?"
+        result = QMessageBox.question(
+            self,
+            "Overwrite output?",
+            message,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return result == QMessageBox.StandardButton.Yes
 
     def _update_progress(self, row: int, value: float, status: str) -> None:
         percent = max(0, min(100, int(value)))
@@ -1427,6 +2237,8 @@ class MainWindow(QMainWindow):
         self.sequence_frame_index = 0
         self.preview_source_path = path
         self.preview_is_sequence = is_sequence
+        self.current_source_raster_size = None
+        self.refresh_scale_controls()
         self.position_slider.setValue(0)
         self.position_slider.setMaximum(0)
         self.position_slider.clear_markers()
@@ -1508,6 +2320,7 @@ class MainWindow(QMainWindow):
         if image.isNull():
             return
         self._last_video_source_pixmap = QPixmap.fromImage(image)
+        self.update_source_raster_size(self._last_video_source_pixmap.size())
         self._refresh_video_display_transform()
 
     def handle_player_position_changed(self, position_ms: int) -> None:
@@ -1579,8 +2392,10 @@ class MainWindow(QMainWindow):
             self.preview_placeholder.setText(frame.name)
             self.update_current_frame_label()
             return
+        self.update_source_raster_size(pixmap.size())
+        self._sync_auto_pixel_aspect_edit(frame)
         pixmap = self._display_pixmap_for_selected_input_transform(pixmap)
-        self.preview_placeholder.set_source_pixmap(pixmap)
+        self.preview_placeholder.set_source_pixmap(pixmap, self.selected_pixel_aspect_for_path(frame))
         self.position_slider.blockSignals(True)
         self.position_slider.setValue(self.sequence_frame_index)
         self.position_slider.blockSignals(False)
@@ -1598,15 +2413,15 @@ class MainWindow(QMainWindow):
         pixmap = _display_pixmap_for_input_transform(
             self._last_video_source_pixmap,
             self.selected_input_transform(),
-            self.ocio_config_path,
+            self.active_ocio_config_path(),
         )
-        self.preview_placeholder.set_source_pixmap(pixmap)
+        self.preview_placeholder.set_source_pixmap(pixmap, self.selected_pixel_aspect_for_path(self._current_preview_frame_path()))
 
     def _display_pixmap_for_selected_input_transform(self, pixmap: QPixmap) -> QPixmap:
         return _display_pixmap_for_input_transform(
             pixmap,
             self.selected_input_transform(),
-            self.ocio_config_path,
+            self.active_ocio_config_path(),
         )
 
     def handle_media_status(self, status: QMediaPlayer.MediaStatus) -> None:
@@ -1840,6 +2655,30 @@ def apply_theme(app: QApplication) -> None:
             padding: 6px;
         }
 
+        QPlainTextEdit#logText {
+            background: #000000;
+            color: #a8a8a8;
+            border: 1px solid #3a3a3a;
+            selection-background-color: #404040;
+            selection-color: #e0e0e0;
+        }
+
+        QLabel:disabled {
+            color: #8c8c8c;
+        }
+
+        QLineEdit:disabled,
+        QComboBox:disabled,
+        QSpinBox:disabled {
+            background: #3a3a3a;
+            color: #8c8c8c;
+            border-color: #484848;
+        }
+
+        QComboBox:disabled::drop-down {
+            border-color: #484848;
+        }
+
         QPushButton {
             background: #464646;
             color: #f0f0f0;
@@ -1891,6 +2730,16 @@ def apply_theme(app: QApplication) -> None:
             background: #8fa8c8;
             border: 1px solid #adc2dc;
         }
+
+        QSlider::groove:horizontal:disabled {
+            background: #383838;
+            border-color: #484848;
+        }
+
+        QSlider::handle:horizontal:disabled {
+            background: #5a5a5a;
+            border-color: #666666;
+        }
         """
     )
 
@@ -1918,12 +2767,16 @@ def _progress_duration_for_job(job: ConvertJob, probed_duration: float | None) -
     fps = _job_fps(job)
     if total_frames and fps:
         return total_frames / fps
+    if _is_still_image_path(job.input):
+        return None
     if probed_duration and probed_duration > 0:
         return probed_duration
     return None
 
 
 def _progress_total_frames_for_job(job: ConvertJob) -> int | None:
+    if "%" not in job.input.name:
+        return None
     frames = sequence_frames(job.input)
     return len(frames) if frames else None
 
@@ -1999,6 +2852,56 @@ def _parse_positive_float(value: str) -> float | None:
     return parsed if parsed > 0 else None
 
 
+def _rounded_output_dimension(value: float, multiple: int = 1) -> int:
+    rounded = max(1, math.floor(float(value) + 0.5))
+    if multiple <= 1:
+        return rounded
+    return max(multiple, (rounded // multiple) * multiple)
+
+
+def _normalized_pixel_aspect(value: float | None) -> float:
+    if value is None or not math.isfinite(value) or value <= 0:
+        return 1.0
+    return max(0.01, min(100.0, float(value)))
+
+
+def _format_pixel_aspect(value: float) -> str:
+    return f"{_normalized_pixel_aspect(value):.6g}"
+
+
+def _pixel_aspect_for_path(path: Path | None) -> float:
+    if path is None or path.suffix.lower() != ".exr" or not path.exists():
+        return 1.0
+    try:
+        stat = path.stat()
+    except OSError:
+        return 1.0
+    return _cached_exr_pixel_aspect_ratio(str(path), stat.st_mtime_ns)
+
+
+@lru_cache(maxsize=1024)
+def _cached_exr_pixel_aspect_ratio(path: str, _mtime_ns: int) -> float:
+    try:
+        import OpenEXR  # noqa: PLC0415
+    except Exception:  # noqa: BLE001 - optional preview dependency.
+        return 1.0
+
+    try:
+        file_object = OpenEXR.InputFile(path)
+    except Exception:  # noqa: BLE001 - invalid/unreadable EXR header should not break preview.
+        return 1.0
+
+    try:
+        header = file_object.header()
+        return _normalized_pixel_aspect(header.get("pixelAspectRatio", 1.0))
+    except Exception:  # noqa: BLE001 - invalid/unreadable EXR header should not break preview.
+        return 1.0
+    finally:
+        close = getattr(file_object, "close", None)
+        if callable(close):
+            close()
+
+
 def _jpeg_quality_percent_to_qscale(value: int) -> int:
     clamped = max(0, min(100, value))
     return round(31 - (clamped / 100) * 29)
@@ -2010,6 +2913,32 @@ def _is_still_image_path(path: Path | str) -> bool:
 
 def _command_color_space_value(value: str) -> str:
     return "none" if value.startswith("ocio:") else value
+
+
+def _video_color_metadata_for_output_transform(output_transform: str, file_type: str) -> dict[str, str]:
+    if file_type not in {"mov", "mp4"}:
+        return {}
+    color_space = _ocio_color_space_name(output_transform) or output_transform
+    normalized = color_space.lower()
+    if normalized in {"rec709", "rec.709", "bt709"}:
+        return {
+            "color_primaries": "bt709",
+            "color_trc": "bt709",
+            "colorspace": "bt709",
+        }
+    if normalized in {"srgb", "output - srgb"}:
+        return {
+            "color_primaries": "bt709",
+            "color_trc": "iec61966-2-1",
+            "colorspace": "bt709",
+        }
+    if normalized in {"linear"}:
+        return {
+            "color_primaries": "bt709",
+            "color_trc": "linear",
+            "colorspace": "bt709",
+        }
+    return {}
 
 
 def _log_transform_value(filters: dict, side: str) -> str:
@@ -2048,11 +2977,11 @@ def _ocio_display_pixmap(pixmap: QPixmap, input_color_space: str, config_path: s
     if not path.exists() or not path.is_file():
         return pixmap
     try:
-        config = ocio.Config.CreateFromFile(str(path))
-        display_color_space = _ocio_display_color_space(config)
-        if not display_color_space:
-            return pixmap
-        processor = config.getProcessor(input_color_space, display_color_space).getDefaultCPUProcessor()
+        processor = _ocio_preview_processor(
+            str(path.resolve()),
+            path.stat().st_mtime_ns,
+            input_color_space,
+        )
     except Exception:  # noqa: BLE001 - preview fallback must not break playback.
         return pixmap
 
@@ -2062,23 +2991,37 @@ def _ocio_display_pixmap(pixmap: QPixmap, input_color_space: str, config_path: s
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
+    if np is None:
+        return pixmap
     image = pixmap.toImage().convertToFormat(QImage.Format.Format_RGBA8888)
-    for y in range(image.height()):
-        for x in range(image.width()):
-            color = image.pixelColor(x, y)
-            transformed = processor.applyRGBA([
-                color.redF(),
-                color.greenF(),
-                color.blueF(),
-                color.alphaF(),
-            ])
-            image.setPixelColor(x, y, QColor.fromRgbF(
-                _clamp_float(transformed[0]),
-                _clamp_float(transformed[1]),
-                _clamp_float(transformed[2]),
-                _clamp_float(transformed[3]),
-            ))
-    return QPixmap.fromImage(image)
+    try:
+        return _ocio_display_pixmap_with_numpy(image, processor)
+    except Exception:  # noqa: BLE001 - preview fallback must not break playback.
+        return pixmap
+
+
+def _ocio_display_pixmap_with_numpy(image: QImage, processor) -> QPixmap:  # noqa: ANN001 - optional OCIO type.
+    width = image.width()
+    height = image.height()
+    bytes_per_line = image.bytesPerLine()
+    raw = np.frombuffer(image.bits(), dtype=np.uint8, count=bytes_per_line * height)
+    rows = raw.reshape((height, bytes_per_line))
+    rgba_u8 = rows[:, : width * 4].reshape((height, width, 4))
+    rgba = np.ascontiguousarray(rgba_u8, dtype=np.float32) / 255.0
+    processor.applyRGBA(rgba)
+    np.clip(rgba, 0.0, 1.0, out=rgba)
+    out_u8 = np.rint(rgba * 255.0).astype(np.uint8)
+    out_image = QImage(out_u8.data, width, height, width * 4, QImage.Format.Format_RGBA8888)
+    return QPixmap.fromImage(out_image.copy())
+
+
+@lru_cache(maxsize=32)
+def _ocio_preview_processor(config_path: str, config_mtime_ns: int, input_color_space: str):  # noqa: ANN001, ARG001
+    config = ocio.Config.CreateFromFile(config_path)
+    display_color_space = _ocio_display_color_space(config)
+    if not display_color_space:
+        raise ValueError("OCIO display color space not found")
+    return config.getProcessor(input_color_space, display_color_space).getDefaultCPUProcessor()
 
 
 def _ocio_display_color_space(config) -> str | None:  # noqa: ANN001 - optional OCIO type.
@@ -2146,10 +3089,6 @@ def _write_ocio_baker_cube_lut(
     path.write_text(baker.bake(), encoding="utf-8")
 
 
-def _clamp_float(value: float) -> float:
-    return max(0.0, min(1.0, float(value)))
-
-
 def _default_input_color_space(path: Path | None) -> str:
     if path is None:
         return "none"
@@ -2164,6 +3103,20 @@ def _fps_from_probe(probe_json: dict) -> float | None:
             fps = _fraction_to_float(stream.get(key))
             if fps:
                 return fps
+    return None
+
+
+def _video_size_from_probe(probe_json: dict) -> QSize | None:
+    for stream in probe_json.get("streams", []):
+        if stream.get("codec_type") != "video":
+            continue
+        try:
+            width = int(stream.get("width", 0))
+            height = int(stream.get("height", 0))
+        except (TypeError, ValueError):
+            return None
+        if width > 0 and height > 0:
+            return QSize(width, height)
     return None
 
 
@@ -2227,9 +3180,21 @@ def _media_summary(
     input_path: Path | None = None,
     fps: float | None = None,
     sequence_frame_count: int | None = None,
+    output_resolution: QSize | None = None,
+    output_codec: str | None = None,
+    output_color_space: str | None = None,
 ) -> str:
-    lines: list[str] = []
+    lines: list[str] = ["Input"]
     fmt = probe_json.get("format", {})
+    video_stream = _first_stream(probe_json, "video")
+    audio_stream = _first_stream(probe_json, "audio")
+    resolution = _stream_resolution(video_stream)
+    if resolution:
+        lines.append(f"Resolution: {resolution}")
+    else:
+        lines.append("Resolution: unknown")
+    lines.append(f"FPS: {_format_summary_fps(fps or _fps_from_probe(probe_json), video_stream)}")
+    lines.append(f"Codec: {_summary_codec(video_stream or audio_stream)}")
     if fmt:
         lines.append(f"Format: {fmt.get('format_name', 'unknown')}")
         lines.append(_duration_summary_line(
@@ -2239,24 +3204,84 @@ def _media_summary(
             sequence_frame_count=sequence_frame_count,
         ))
         lines.append(f"Size: {_format_file_size(_summary_size_value(fmt.get('size'), input_path))}")
+    lines.append(f"Created by: {_summary_created_by(probe_json, input_path)}")
 
-    for stream in probe_json.get("streams", []):
-        stream_type = stream.get("codec_type", "stream")
-        codec = stream.get("codec_name", "unknown")
-        if stream_type == "video":
-            lines.append("")
-            lines.append("Video")
-            lines.append(f"Codec: {codec}")
-            lines.append(f"Size: {stream.get('width')}x{stream.get('height')}")
-            lines.append(f"FPS: {stream.get('avg_frame_rate', 'unknown')}")
-            lines.append(f"Pixel format: {stream.get('pix_fmt', 'unknown')}")
-        elif stream_type == "audio":
-            lines.append("")
-            lines.append("Audio")
-            lines.append(f"Codec: {codec}")
-            lines.append(f"Sample rate: {stream.get('sample_rate', 'unknown')}")
-            lines.append(f"Channels: {stream.get('channels', 'unknown')}")
+    if audio_stream:
+        lines.append("")
+        lines.append("Audio")
+        lines.append(f"Codec: {_summary_codec(audio_stream)}")
+        lines.append(f"Sample rate: {audio_stream.get('sample_rate', 'unknown')}")
+        lines.append(f"Channels: {audio_stream.get('channels', 'unknown')}")
+
+    if output_resolution is not None or output_codec or output_color_space:
+        lines.append("")
+        lines.append("Output")
+        if output_resolution is not None:
+            lines.append(f"Resolution: {output_resolution.width()} x {output_resolution.height()} px")
+        else:
+            lines.append("Resolution: unknown")
+        lines.append(f"FPS: {_format_summary_fps(fps, None)}")
+        lines.append(f"Codec: {output_codec or 'unknown'}")
+        lines.append(f"Color Space: {output_color_space or 'unknown'}")
     return "\n".join(lines)
+
+
+def _first_stream(probe_json: dict, stream_type: str) -> dict | None:
+    for stream in probe_json.get("streams", []):
+        if stream.get("codec_type") == stream_type:
+            return stream
+    return None
+
+
+def _stream_resolution(stream: dict | None) -> str | None:
+    if not stream:
+        return None
+    width = stream.get("width")
+    height = stream.get("height")
+    if width is None or height is None:
+        return None
+    return f"{width} x {height} px"
+
+
+def _summary_codec(stream: dict | None) -> str:
+    if not stream:
+        return "unknown"
+    return str(stream.get("codec_long_name") or stream.get("codec_name") or "unknown")
+
+
+def _format_summary_fps(fps: float | None, stream: dict | None) -> str:
+    safe_fps = fps
+    if not safe_fps and stream:
+        safe_fps = _fraction_to_float(stream.get("avg_frame_rate"))
+    if not safe_fps:
+        return "unknown"
+    return f"{safe_fps:.3f}".rstrip("0").rstrip(".")
+
+
+def _summary_created_by(probe_json: dict, input_path: Path | None = None) -> str:
+    for tags in _summary_tag_sources(probe_json):
+        for key in ("encoded_by", "encoder", "writing_application", "software", "creation_app"):
+            value = tags.get(key)
+            if value:
+                return str(value)
+    header = _openexr_header(_metadata_source_path(input_path))
+    if header:
+        for key in ("software", "cameraSoftwarePackageName", "owner"):
+            value = header.get(key)
+            if value:
+                return _metadata_value_to_string(value)
+    return "unknown"
+
+
+def _summary_tag_sources(probe_json: dict) -> list[dict]:
+    sources: list[dict] = []
+    fmt = probe_json.get("format", {})
+    if isinstance(fmt.get("tags"), dict):
+        sources.append(fmt["tags"])
+    for stream in probe_json.get("streams", []):
+        if isinstance(stream.get("tags"), dict):
+            sources.append(stream["tags"])
+    return sources
 
 
 def _duration_summary_line(
@@ -2316,6 +3341,113 @@ def _summary_size_value(format_size: object, input_path: Path | None = None) -> 
                     return format_size
             return total
     return format_size
+
+
+def _metadata_rows(probe_json: dict, input_path: Path | None = None) -> list[tuple[str, str, str, str]]:
+    rows: list[tuple[str, str, str, str]] = []
+    exr_path = _metadata_source_path(input_path)
+    if exr_path and exr_path.suffix.lower() == ".exr":
+        rows.extend(_openexr_metadata_rows(exr_path))
+    rows.extend(_flatten_metadata_rows("ffprobe", "root", probe_json))
+    return rows
+
+
+def _metadata_display_key(source: str, group: str, key: str) -> str:
+    return key
+
+
+def _metadata_full_key(source: str, group: str, key: str) -> str:
+    parts = [part for part in (source, "" if group == "root" else group, key) if part]
+    return ".".join(parts)
+
+
+def _metadata_source_path(input_path: Path | None) -> Path | None:
+    if input_path is None:
+        return None
+    frames = sequence_frames(input_path)
+    if frames:
+        return frames[0]
+    if input_path.exists():
+        return input_path
+    return None
+
+
+def _openexr_metadata_rows(path: Path) -> list[tuple[str, str, str, str]]:
+    header = _openexr_header(path)
+    if not header:
+        return []
+    rows: list[tuple[str, str, str, str]] = []
+    for key in sorted(header):
+        rows.append(("OpenEXR", "header", str(key), _metadata_value_to_string(header[key])))
+    return rows
+
+
+def _openexr_header(path: Path | None) -> dict | None:
+    if path is None or path.suffix.lower() != ".exr" or not path.exists():
+        return None
+    try:
+        import OpenEXR  # noqa: PLC0415
+    except Exception:  # noqa: BLE001 - OpenEXR is optional for metadata display.
+        return None
+    try:
+        file_object = OpenEXR.InputFile(str(path))
+    except Exception:  # noqa: BLE001 - unreadable EXR metadata should not break probe.
+        return None
+    try:
+        return dict(file_object.header())
+    except Exception:  # noqa: BLE001 - unreadable EXR metadata should not break probe.
+        return None
+    finally:
+        close = getattr(file_object, "close", None)
+        if callable(close):
+            close()
+
+
+def _flatten_metadata_rows(
+    source: str,
+    group: str,
+    value: object,
+    key_prefix: str = "",
+) -> list[tuple[str, str, str, str]]:
+    rows: list[tuple[str, str, str, str]] = []
+    if isinstance(value, dict):
+        for key in sorted(value):
+            child = value[key]
+            key_text = str(key)
+            if isinstance(child, dict):
+                rows.extend(_flatten_metadata_rows(source, _join_metadata_path(group, key_text), child))
+            elif isinstance(child, list):
+                rows.extend(_flatten_metadata_rows(source, _join_metadata_path(group, key_text), child))
+            else:
+                rows.append((source, group, f"{key_prefix}{key_text}", _metadata_value_to_string(child)))
+        return rows
+    if isinstance(value, list):
+        for index, child in enumerate(value):
+            indexed_group = f"{group}[{index}]"
+            if isinstance(child, (dict, list)):
+                rows.extend(_flatten_metadata_rows(source, indexed_group, child))
+            else:
+                rows.append((source, group, str(index), _metadata_value_to_string(child)))
+        return rows
+    rows.append((source, group, key_prefix.rstrip(".") or "value", _metadata_value_to_string(value)))
+    return rows
+
+
+def _join_metadata_path(group: str, key: str) -> str:
+    if not group or group == "root":
+        return key
+    return f"{group}.{key}"
+
+
+def _metadata_value_to_string(value: object) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    if isinstance(value, (dict, list, tuple)):
+        try:
+            return json.dumps(value, ensure_ascii=False, default=str)
+        except TypeError:
+            return str(value)
+    return str(value)
 
 
 def _frame_number_from_path(path: Path) -> int | None:

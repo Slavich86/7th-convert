@@ -49,7 +49,11 @@ def preserve_exr_metadata_for_job(job: ConvertJob) -> ExrMetadataCopyResult:
         if not source.exists() or not output.exists():
             skipped += 1
             continue
-        copy_exr_header_metadata(source, output)
+        copy_exr_header_metadata(
+            source,
+            output,
+            preserve_pixel_aspect=bool(job.preset.filters.get("preserve_pixel_aspect")),
+        )
         copied += 1
 
     return ExrMetadataCopyResult(
@@ -78,7 +82,7 @@ def exr_metadata_frame_pairs(job: ConvertJob) -> list[tuple[Path, Path]]:
     return [(job.input, job.output)]
 
 
-def copy_exr_header_metadata(source: Path, output: Path) -> None:
+def copy_exr_header_metadata(source: Path, output: Path, preserve_pixel_aspect: bool = False) -> None:
     try:
         import OpenEXR  # noqa: PLC0415
     except Exception as exc:  # noqa: BLE001 - user-facing optional dependency error.
@@ -94,7 +98,10 @@ def copy_exr_header_metadata(source: Path, output: Path) -> None:
 
         merged_header = output_header.copy()
         for key, value in source_header.items():
-            if key in OUTPUT_STRUCTURE_KEYS or key in UNWRITABLE_OPENEXR_KEYS:
+            if (
+                key in OUTPUT_STRUCTURE_KEYS
+                and not (preserve_pixel_aspect and key == "pixelAspectRatio")
+            ) or key in UNWRITABLE_OPENEXR_KEYS:
                 continue
             merged_header[key] = value
 

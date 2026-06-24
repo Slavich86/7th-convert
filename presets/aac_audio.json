@@ -1,17 +1,18 @@
 {
-  "id": "wav_pcm",
-  "name": "WAV PCM 16-bit",
+  "id": "aac_audio",
+  "name": "AAC Audio",
   "group": "Audio",
   "output": {
-    "container": "wav",
-    "extension": "wav"
+    "container": "adts",
+    "extension": "aac"
   },
   "video": {
     "enabled": false
   },
   "audio": {
     "enabled": true,
-    "codec": "pcm_s16le",
+    "codec": "aac",
+    "bitrate": "192k",
     "sample_rate": 48000,
     "channels": "source"
   },
