@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=7th VFX convertor
+Comment=VFX media converter for video, image sequences, still images, and audio
+Exec=sh -c 'cd "$(dirname "$1")" && exec ./7th-vfx-convertor.sh' sh %k
+Icon=seventh-vfx-convertor
+Terminal=false
+Categories=AudioVideo;Video;Graphics;
+StartupNotify=true
