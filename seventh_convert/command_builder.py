@@ -122,6 +122,10 @@ def _append_video_args(args: list[str], video: dict, filters: dict) -> None:
         if value:
             args.extend([f"-{key}", str(value)])
 
+    if video.get("palette"):
+        _append_palette_filter_args(args, filters, video)
+        return
+
     vf = _video_filter(filters, video)
     if vf:
         args.extend(["-vf", vf])
@@ -200,6 +204,24 @@ def _video_filter(filters: dict, video: dict | None = None) -> str | None:
     if not parts:
         return None
     return ",".join(parts)
+
+
+def _append_palette_filter_args(args: list[str], filters: dict, video: dict) -> None:
+    vf = _video_filter(filters, video)
+    source = f"[0:v]{vf}," if vf else "[0:v]"
+    palettegen = video.get("palettegen", {}) if isinstance(video.get("palettegen"), dict) else {}
+    paletteuse = video.get("paletteuse", {}) if isinstance(video.get("paletteuse"), dict) else {}
+    palettegen_filter = _filter_with_options("palettegen", palettegen)
+    paletteuse_filter = _filter_with_options("paletteuse", paletteuse)
+    filter_complex = f"{source}split[a][b];[a]{palettegen_filter}[p];[b][p]{paletteuse_filter}[v]"
+    args.extend(["-filter_complex", filter_complex, "-map", "[v]"])
+
+
+def _filter_with_options(name: str, options: dict) -> str:
+    option_parts = [f"{key}={value}" for key, value in options.items() if value is not None]
+    if not option_parts:
+        return name
+    return f"{name}={':'.join(option_parts)}"
 
 
 def _color_transfer_filter(input_color: str, output_color: str) -> str | None:

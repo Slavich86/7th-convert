@@ -4,19 +4,24 @@ import json
 import hashlib
 import math
 import os
+import platform
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import traceback
+import urllib.error
+import urllib.request
 from importlib import resources
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, QPoint, QSize, QSettings, Qt, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QColor, QColorSpace, QImage, QKeyEvent, QKeySequence, QPainter, QPixmap
+from PySide6.QtCore import QEvent, QObject, QPoint, QSize, QSettings, Qt, QThread, QTimer, QUrl, Signal, qVersion
+from PySide6.QtGui import QAction, QColor, QColorSpace, QDesktopServices, QIcon, QImage, QKeyEvent, QKeySequence, QPainter, QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoFrame, QVideoSink
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
@@ -57,8 +62,10 @@ from .command_builder import ConvertJob, build_ffmpeg_args
 from .converter import format_command, output_exists_for_job, same_input_and_output, validate_job
 from .exr_metadata import preserve_exr_metadata_for_job
 from .ffprobe import duration_seconds, probe
+from .media_support import unsupported_ffmpeg_video_reason
 from .presets import Preset, get_preset, load_presets
-from .sequence import sequence_frames, sequence_groups, sequence_start_number, split_sequence_name
+from .sequence import sequence_frames, sequence_groups, sequence_pattern_to_regex, sequence_start_number, split_sequence_name
+from . import __version__
 
 try:
     import PyOpenColorIO as ocio
@@ -71,7 +78,17 @@ except Exception:  # noqa: BLE001 - optional runtime dependency for faster OCIO 
     np = None
 
 
+APP_DISPLAY_NAME = "7th VFX convertor"
+APP_SETTINGS_ORG = "7th Convert"
+APP_SETTINGS_NAME = "7th Convert"
+APP_CONFIG_DIR_NAME = "7th_VFX_convertor"
+APP_SETTINGS_JSON = "settings.json"
+APP_ERROR_LOG = "errors.log"
+USER_PRESET_VERSION = 1
+USER_PRESET_EXTENSION = ".json"
+
 STILL_IMAGE_EXTENSIONS = {
+    ".dpx",
     ".exr",
     ".gif",
     ".jpeg",
@@ -81,6 +98,28 @@ STILL_IMAGE_EXTENSIONS = {
     ".tga",
     ".tif",
     ".tiff",
+}
+
+VIDEO_INPUT_EXTENSIONS = {
+    ".avi",
+    ".m4v",
+    ".mkv",
+    ".mov",
+    ".mp4",
+    ".mxf",
+    ".ts",
+    ".webm",
+}
+
+VIDEO_OUTPUT_FILE_TYPES = {"mov", "mp4"}
+
+AUDIO_INPUT_EXTENSIONS = {
+    ".aac",
+    ".flac",
+    ".m4a",
+    ".mp3",
+    ".ogg",
+    ".wav",
 }
 
 
@@ -99,6 +138,14 @@ PIXEL_ASPECT_AUTO = "auto"
 PIXEL_ASPECT_MANUAL = "manual"
 ANAMORPH_OUTPUT_PRESERVE = "preserve"
 ANAMORPH_OUTPUT_BAKE = "bake"
+FPS_OUTPUT_FILE_TYPES = {"mov", "mp4"}
+QUEUE_COL_ACTIVE = 0
+QUEUE_COL_INPUT = 1
+QUEUE_COL_OUTPUT = 2
+QUEUE_COL_PRESET = 3
+QUEUE_COL_STATUS = 4
+QUEUE_COL_PROGRESS = 5
+QUEUE_COL_ACTIONS = 6
 
 
 @dataclass(frozen=True)
@@ -108,6 +155,64 @@ class BuiltinOcioConfig:
     config_relative_path: str
     default_input_by_extension: dict[str, str]
     default_output_by_file_type: dict[str, str]
+
+
+@dataclass(frozen=True)
+class QueueJobSnapshot:
+    job: ConvertJob
+    command: list[str]
+    details: str
+
+
+def _app_config_dir() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME")
+    root = Path(base).expanduser() if base else Path.home() / ".config"
+    return root / APP_CONFIG_DIR_NAME
+
+
+def _user_presets_dir(config_dir: Path | None = None) -> Path:
+    return (config_dir or _app_config_dir()) / "presets"
+
+
+def _settings_json_path(config_dir: Path | None = None) -> Path:
+    return (config_dir or _app_config_dir()) / APP_SETTINGS_JSON
+
+
+def _app_logs_dir(config_dir: Path | None = None) -> Path:
+    return (config_dir or _app_config_dir()) / "logs"
+
+
+def _app_error_log_path(config_dir: Path | None = None) -> Path:
+    return _app_logs_dir(config_dir) / APP_ERROR_LOG
+
+
+def _read_app_settings(config_dir: Path | None = None) -> dict:
+    path = _settings_json_path(config_dir)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_app_settings(settings: dict, config_dir: Path | None = None) -> None:
+    path = _settings_json_path(config_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(settings, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def _existing_directory_from_setting(settings: dict, key: str) -> Path | None:
+    value = settings.get(key)
+    if not isinstance(value, str) or not value:
+        return None
+    path = Path(value).expanduser()
+    return path if path.exists() and path.is_dir() else None
+
+
+def _default_user_preset_path(config_dir: Path | None = None) -> Path:
+    return _user_presets_dir(config_dir) / "converter_preset.json"
 
 
 BUILTIN_OCIO_CONFIGS = {
@@ -123,13 +228,20 @@ BUILTIN_OCIO_CONFIGS = {
             ".gif": "sRGB",
             ".jpeg": "sRGB",
             ".jpg": "sRGB",
+            ".m4v": "sRGB",
+            ".mkv": "rec709",
             ".mov": "rec709",
             ".mp4": "sRGB",
+            ".mxf": "rec709",
             ".png": "sRGB",
+            ".ts": "rec709",
             ".targa": "sRGB",
             ".tga": "sRGB",
+            ".avi": "rec709",
+            ".webm": "sRGB",
         },
         default_output_by_file_type={
+            "dpx": "Cineon",
             "exr": "linear",
             "gif": "sRGB",
             "jpg": "sRGB",
@@ -142,18 +254,26 @@ BUILTIN_OCIO_CONFIGS = {
 }
 
 INPUT_COLOR_DEFAULT_BY_EXTENSION = {
+    ".dpx": "srgb",
     ".exr": "linear",
     ".gif": "srgb",
     ".jpeg": "srgb",
     ".jpg": "srgb",
+    ".m4v": "srgb",
+    ".mkv": "rec709",
     ".mov": "rec709",
     ".mp4": "srgb",
+    ".mxf": "rec709",
     ".png": "srgb",
+    ".ts": "rec709",
     ".targa": "srgb",
     ".tga": "srgb",
+    ".avi": "rec709",
+    ".webm": "srgb",
 }
 
 OUTPUT_COLOR_DEFAULT_BY_FILE_TYPE = {
+    "dpx": "srgb",
     "exr": "linear",
     "gif": "srgb",
     "jpg": "srgb",
@@ -185,6 +305,27 @@ OUTPUT_OPTIONS = {
         },
         "default_codec": "exr",
     },
+    "dpx": {
+        "label": "dpx",
+        "extension": "dpx",
+        "sequence": True,
+        "codecs": {
+            "dpx": {
+                "label": "DPX",
+                "preset": "dpx_sequence",
+                "profile_label": "Color / Bit Depth",
+                "profiles": {
+                    "rgb_10": {"label": "RGB 10-bit", "pix_fmt": "gbrp10be"},
+                    "rgb_12": {"label": "RGB 12-bit", "pix_fmt": "gbrp12be"},
+                    "rgb_16": {"label": "RGB 16-bit", "pix_fmt": "rgb48be"},
+                    "rgba_16": {"label": "RGBA 16-bit", "pix_fmt": "rgba64be"},
+                    "rgb_8": {"label": "RGB 8-bit", "pix_fmt": "rgb24"},
+                },
+                "default_profile": "rgb_10",
+            }
+        },
+        "default_codec": "dpx",
+    },
     "gif": {
         "label": "gif",
         "extension": "gif",
@@ -192,10 +333,28 @@ OUTPUT_OPTIONS = {
             "gif": {
                 "label": "GIF",
                 "preset": "gif",
+                "profile_label": "Palette",
                 "profiles": {
-                    "standard": {"label": "Standard"},
+                    "palette_sierra": {
+                        "label": "Optimized Palette / Sierra",
+                        "gif_palette": True,
+                        "palettegen": {"stats_mode": "diff"},
+                        "paletteuse": {"dither": "sierra2_4a"},
+                    },
+                    "palette_bayer": {
+                        "label": "Optimized Palette / Bayer",
+                        "gif_palette": True,
+                        "palettegen": {"stats_mode": "diff"},
+                        "paletteuse": {"dither": "bayer", "bayer_scale": 3},
+                    },
+                    "palette_fast": {
+                        "label": "Optimized Palette / No Dither",
+                        "gif_palette": True,
+                        "palettegen": {"stats_mode": "diff"},
+                        "paletteuse": {"dither": "none"},
+                    },
                 },
-                "default_profile": "standard",
+                "default_profile": "palette_sierra",
             }
         },
         "default_codec": "gif",
@@ -565,17 +724,21 @@ class ConvertWorker(QThread):
     progress_changed = Signal(float, str)
     log_line = Signal(str)
     finished_with_code = Signal(int)
-    failed = Signal(str)
+    failed = Signal(str, str)
 
     def __init__(self, job: ConvertJob, log_path: Path | None = None) -> None:
         super().__init__()
         self.job = job
         self.log_path = log_path
+        self.process: subprocess.Popen | None = None
 
     def run(self) -> None:
         try:
             validate_job(self.job)
             probe_json = probe(self.job.input)
+            unsupported_reason = unsupported_ffmpeg_video_reason(probe_json, self.job.input)
+            if unsupported_reason:
+                raise RuntimeError(unsupported_reason)
             duration = duration_seconds(probe_json)
             args = build_ffmpeg_args(self.job)
             progress_args = args[:-1] + ["-progress", "pipe:1", "-nostats", args[-1]]
@@ -620,6 +783,7 @@ class ConvertWorker(QThread):
                 text=True,
                 bufsize=1,
             )
+            self.process = process
 
             assert process.stdout is not None
             for line in process.stdout:
@@ -664,7 +828,32 @@ class ConvertWorker(QThread):
             log_file = locals().get("log_file")
             if log_file:
                 log_file.close()
+            self.failed.emit(str(exc), traceback.format_exc())
+
+    def cancel(self) -> None:
+        process = self.process
+        if process is not None and process.poll() is None:
+            process.terminate()
+
+
+class UpdateCheckWorker(QThread):
+    update_found = Signal(str, str)
+    up_to_date = Signal(str)
+    failed = Signal(str)
+
+    def run(self) -> None:
+        try:
+            tag, url = _latest_github_version("Slavich86", "7th-convert")
+        except Exception as exc:  # noqa: BLE001 - concise UI message.
             self.failed.emit(str(exc))
+            return
+        if not tag:
+            self.failed.emit("No GitHub release or tag was found.")
+            return
+        if _version_is_newer(tag, __version__):
+            self.update_found.emit(tag, url or "https://github.com/Slavich86/7th-convert")
+            return
+        self.up_to_date.emit(tag)
 
 
 @dataclass(frozen=True)
@@ -706,10 +895,17 @@ class SequenceFileDialog(QDialog):
         path_row = QHBoxLayout()
         self.dir_edit = QLineEdit(str(self.current_dir))
         self.dir_edit.editingFinished.connect(self.refresh_list)
-        icon_provider = QFileIconProvider()
-        self.up_button = QPushButton("↑")
-        self.up_button.setIcon(icon_provider.icon(QFileIconProvider.IconType.Folder))
-        self.up_button.setFixedWidth(42)
+        up_icon_path = Path(__file__).resolve().parent / "assets" / "icons" / "arrow-up.png"
+        self.up_button = QPushButton()
+        if up_icon_path.exists():
+            self.up_button.setIcon(QIcon(str(up_icon_path)))
+        else:
+            icon_provider = QFileIconProvider()
+            self.up_button.setText("↑")
+            self.up_button.setIcon(icon_provider.icon(QFileIconProvider.IconType.Folder))
+        self.up_button.setToolTip("Go to parent folder")
+        self.up_button.setFixedSize(32, 32)
+        self.up_button.setIconSize(QSize(20, 20))
         self.up_button.clicked.connect(self.go_up)
         self.seq_check = QCheckBox("seq")
         self.seq_check.toggled.connect(self.refresh_list)
@@ -820,6 +1016,42 @@ def _input_list_items(directory: Path, seq_mode: bool) -> list[InputListItem]:
             continue
         items.append(InputListItem(path.name, path, path, False))
     return items
+
+
+def _selected_input_from_image_file(path: Path) -> SelectedInput:
+    for _label, pattern, preview, count, start, end, start_text, end_text in sequence_groups(path.parent):
+        match = split_sequence_name(path.name)
+        pattern_regex = sequence_pattern_to_regex(pattern.name)
+        if (
+            match is not None
+            and pattern_regex is not None
+            and pattern_regex.match(path.name)
+            and start <= int(match[1]) <= end
+        ):
+            return SelectedInput(
+                pattern,
+                preview,
+                True,
+                start,
+                end,
+                count,
+                start_text,
+                end_text,
+            )
+    return SelectedInput(path, path, False)
+
+
+def _single_local_file_from_drop_event(event) -> Path | None:  # noqa: ANN001 - Qt event type differs by binding version.
+    mime_data = event.mimeData() if hasattr(event, "mimeData") else None
+    if mime_data is None or not mime_data.hasUrls():
+        return None
+    urls = mime_data.urls()
+    if len(urls) != 1:
+        return None
+    url = urls[0]
+    if not url.isLocalFile():
+        return None
+    return Path(url.toLocalFile()).expanduser()
 
 
 def _directory_items(directory: Path) -> list[InputListItem]:
@@ -989,13 +1221,22 @@ class PreferencesDialog(QDialog):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, use_media: bool | None = None, settings: QSettings | None = None) -> None:
+    def __init__(
+        self,
+        use_media: bool | None = None,
+        settings: QSettings | None = None,
+        app_config_dir: Path | None = None,
+    ) -> None:
         super().__init__()
-        self.setWindowTitle("7th Convert")
+        self.setWindowTitle(APP_DISPLAY_NAME)
         self.resize(1180, 760)
+        self.setAcceptDrops(True)
 
         self.presets = load_presets()
-        self.settings = settings or QSettings("7th Convert", "7th Convert")
+        self.settings = settings or QSettings(APP_SETTINGS_ORG, APP_SETTINGS_NAME)
+        self.app_config_dir = app_config_dir or _app_config_dir()
+        self.app_settings = _read_app_settings(self.app_config_dir)
+        self.user_presets_dir = _user_presets_dir(self.app_config_dir)
         self.color_workflow = str(self.settings.value("color/workflow", COLOR_WORKFLOW_BASIC))
         self.ocio_config_path = str(self.settings.value("ocio/config_path", ""))
         self.builtin_ocio_config = str(self.settings.value("ocio/builtin_config", "nuke-default"))
@@ -1003,9 +1244,19 @@ class MainWindow(QMainWindow):
         self.ocio_status = "No OCIO config selected"
         self.reload_ocio_config()
         self.current_probe_json: dict | None = None
+        self.current_input_has_audio = False
+        self.current_input_unsupported_reason: str | None = None
+        self.last_error_report = ""
         self.current_worker: ConvertWorker | None = None
+        self.update_check_worker: UpdateCheckWorker | None = None
+        self.queue_jobs: list[QueueJobSnapshot] = []
+        self.queue_run_all_active = False
+        self.queue_pause_requested = False
+        self.queue_cancel_requested = False
+        self._updating_queue_table = False
         self.use_media = os.environ.get("QT_QPA_PLATFORM") != "offscreen" if use_media is None else use_media
         self.current_fps = 25.0
+        self.fps_value_is_manual = False
         self.current_source_raster_size: QSize | None = None
         self._updating_scale_controls = False
 
@@ -1051,6 +1302,22 @@ class MainWindow(QMainWindow):
         open_action.triggered.connect(self.browse_input)
         file_menu.addAction(open_action)
 
+        save_preset_action = QAction("Save Preset...", self)
+        save_preset_action.triggered.connect(self.save_user_preset)
+        file_menu.addAction(save_preset_action)
+
+        load_preset_action = QAction("Load Preset...", self)
+        load_preset_action.triggered.connect(self.load_user_preset)
+        file_menu.addAction(load_preset_action)
+
+        file_menu.addSeparator()
+
+        open_output_folder_action = QAction("Open Output Folder", self)
+        open_output_folder_action.triggered.connect(self.open_output_folder)
+        file_menu.addAction(open_output_folder_action)
+
+        file_menu.addSeparator()
+
         quit_action = QAction("Quit", self)
         quit_action.triggered.connect(self.close)
         file_menu.addAction(quit_action)
@@ -1059,6 +1326,125 @@ class MainWindow(QMainWindow):
         preferences_action = QAction("Preferences", self)
         preferences_action.triggered.connect(self.open_preferences)
         edit_menu.addAction(preferences_action)
+
+        help_menu = self.menuBar().addMenu("&Help")
+        check_updates_action = QAction("Check for Updates...", self)
+        check_updates_action.triggered.connect(self.check_for_updates)
+        help_menu.addAction(check_updates_action)
+
+        runtime_action = QAction("Runtime", self)
+        runtime_action.triggered.connect(self.show_runtime)
+        help_menu.addAction(runtime_action)
+
+        copy_last_error_action = QAction("Copy Last Error", self)
+        copy_last_error_action.triggered.connect(self.copy_last_error)
+        help_menu.addAction(copy_last_error_action)
+
+        about_action = QAction("About", self)
+        about_action.triggered.connect(self.show_about)
+        help_menu.addAction(about_action)
+
+    def show_about(self) -> None:
+        QMessageBox.about(
+            self,
+            f"About {APP_DISPLAY_NAME}",
+            "\n".join((
+                f"{APP_DISPLAY_NAME}",
+                f"Version: {__version__}",
+                "",
+                "Desktop media converter for VFX workflows.",
+                "",
+                "GitHub: https://github.com/Slavich86/7th-convert",
+                "",
+                "Donate for converter development",
+                "PayPal: sl.oxuta@gmail.com",
+            )),
+        )
+
+    def show_runtime(self) -> None:
+        QMessageBox.information(
+            self,
+            "Runtime",
+            "\n".join((
+                "Runtime dependencies",
+                "",
+                f"Python: {platform.python_version()}",
+                f"Qt/PySide6: {qVersion()}",
+                f"FFmpeg: {_tool_status('ffmpeg')}",
+                f"FFprobe: {_tool_status('ffprobe')}",
+                f"OpenEXR Python: {_python_module_status('OpenEXR')}",
+                f"PyOpenColorIO: {_python_module_status('PyOpenColorIO')}",
+                "",
+                f"Config: {_app_config_dir()}",
+            )),
+        )
+
+    def copy_last_error(self) -> None:
+        if not self.last_error_report:
+            QMessageBox.information(self, "Copy Last Error", "No application or conversion error has been recorded yet.")
+            return
+        QApplication.clipboard().setText(self.last_error_report)
+        self.progress_label.setText("Last error copied")
+
+    def check_for_updates(self) -> None:
+        if self.update_check_worker is not None and self.update_check_worker.isRunning():
+            QMessageBox.information(self, "Check for Updates", "Update check is already running.")
+            return
+        self.progress_label.setText("Checking for updates...")
+        worker = UpdateCheckWorker(self)
+        worker.update_found.connect(self.handle_update_found)
+        worker.up_to_date.connect(self.handle_up_to_date)
+        worker.failed.connect(self.handle_update_check_failed)
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(lambda: setattr(self, "update_check_worker", None))
+        self.update_check_worker = worker
+        worker.start()
+
+    def handle_update_found(self, latest_tag: str, url: str) -> None:
+        self.progress_label.setText("Update available")
+        QMessageBox.information(
+            self,
+            "Update Available",
+            f"Current version: {__version__}\nLatest version: {latest_tag}\n\n{url}",
+        )
+
+    def handle_up_to_date(self, latest_tag: str) -> None:
+        self.progress_label.setText("Up to date")
+        QMessageBox.information(
+            self,
+            "Check for Updates",
+            f"{APP_DISPLAY_NAME} is up to date.\n\nCurrent version: {__version__}\nLatest GitHub tag: {latest_tag}",
+        )
+
+    def handle_update_check_failed(self, message: str) -> None:
+        self.progress_label.setText("Update check failed")
+        self.record_error("Check for Updates failed", message)
+        QMessageBox.warning(self, "Check for Updates failed", message)
+
+    def record_error(
+        self,
+        title: str,
+        message: str,
+        *,
+        job: ConvertJob | None = None,
+        command: list[str] | None = None,
+        traceback_text: str | None = None,
+    ) -> None:
+        report = _error_report(
+            title,
+            message,
+            config_dir=self.app_config_dir,
+            input_path=job.input if job else Path(self.input_edit.text()).expanduser() if self.input_edit.text().strip() else None,
+            output_path=job.output if job else Path(self.output_edit.text()).expanduser() if self.output_edit.text().strip() else None,
+            file_type=str(self.file_type_combo.currentData()) if hasattr(self, "file_type_combo") else None,
+            codec=self.selected_codec() if hasattr(self, "codec_combo") else None,
+            input_transform=self.selected_input_transform() if hasattr(self, "input_transform_combo") else None,
+            output_transform=self.selected_output_transform() if hasattr(self, "output_transform_combo") else None,
+            command=command,
+            traceback_text=traceback_text,
+        )
+        self.last_error_report = report
+        _append_error_log(report, self.app_config_dir)
 
     def reload_ocio_config(self) -> None:
         if self.color_workflow == COLOR_WORKFLOW_BASIC:
@@ -1122,12 +1508,201 @@ class MainWindow(QMainWindow):
         self.refresh_color_transform_defaults()
         self.refresh_preview_display_transform()
 
+    def save_user_preset(self) -> None:
+        self.user_presets_dir.mkdir(parents=True, exist_ok=True)
+        path, _selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Save converter preset",
+            str(self._default_save_preset_path()),
+            "7th VFX converter presets (*.json);;All files (*)",
+        )
+        if not path:
+            return
+        preset_path = Path(path).expanduser()
+        if preset_path.suffix.lower() != USER_PRESET_EXTENSION:
+            preset_path = preset_path.with_suffix(USER_PRESET_EXTENSION)
+        try:
+            preset_path.parent.mkdir(parents=True, exist_ok=True)
+            preset_path.write_text(
+                json.dumps(self.converter_user_preset(), indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+        except Exception as exc:  # noqa: BLE001 - concise UI message.
+            self.record_error("Save Preset failed", str(exc), traceback_text=traceback.format_exc())
+            QMessageBox.warning(self, "Save Preset failed", str(exc))
+            return
+        self._remember_directory("last_preset_dir", preset_path.parent)
+        self.progress_label.setText(f"Preset saved: {preset_path.name}")
+
+    def load_user_preset(self) -> None:
+        self.user_presets_dir.mkdir(parents=True, exist_ok=True)
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Load converter preset",
+            str(self._last_directory("last_preset_dir", self.user_presets_dir)),
+            "7th VFX converter presets (*.json);;All files (*)",
+        )
+        if not path:
+            return
+        preset_path = Path(path).expanduser()
+        try:
+            data = json.loads(preset_path.read_text(encoding="utf-8"))
+            self.apply_user_preset(data)
+        except Exception as exc:  # noqa: BLE001 - concise UI message.
+            self.record_error("Load Preset failed", str(exc), traceback_text=traceback.format_exc())
+            QMessageBox.warning(self, "Load Preset failed", str(exc))
+            return
+        self._remember_directory("last_preset_dir", preset_path.parent)
+        self.progress_label.setText(f"Preset loaded: {preset_path.name}")
+
+    def converter_user_preset(self) -> dict:
+        return {
+            "version": USER_PRESET_VERSION,
+            "app": APP_DISPLAY_NAME,
+            "converter": self.converter_state(),
+        }
+
+    def converter_state(self) -> dict:
+        return {
+            "input": self.input_edit.text().strip(),
+            "audio_input": self.audio_input_edit.text().strip(),
+            "output": self.output_edit.text().strip(),
+            "output_path_is_manual": self.output_path_is_manual,
+            "file_type": self.selected_file_type(),
+            "codec": self.selected_codec(),
+            "profile": self.selected_profile(),
+            "fps": self.fps_edit.text().strip(),
+            "fps_is_manual": self.fps_value_is_manual,
+            "time_mode": self.time_mode_combo.currentData(),
+            "in": self.in_edit.text().strip(),
+            "out": self.out_edit.text().strip(),
+            "scale": self.scale_slider.value() / 1000,
+            "scale_slider": self.scale_slider.value(),
+            "output_width": self.output_width_spin.value(),
+            "output_height": self.output_height_spin.value(),
+            "pixel_aspect_mode": self.selected_preview_pixel_aspect_mode(),
+            "manual_par": self.manual_pixel_aspect_edit.text().strip(),
+            "pixel_aspect_output": self.selected_anamorph_output_mode(),
+            "color_workflow": self.color_workflow,
+            "builtin_ocio_config": self.builtin_ocio_config,
+            "ocio_config_path": self.ocio_config_path,
+            "input_transform": self.selected_input_transform(),
+            "output_transform": self.selected_output_transform(),
+            "jpg_quality": self.jpg_quality_slider.value(),
+            "audio_format": self.audio_format_combo.currentData(),
+            "audio_profile": self.audio_profile_combo.currentData(),
+            "copy_video_add_audio": self.copy_video_add_audio_check.isChecked(),
+            "overwrite": self.overwrite_check.isChecked(),
+        }
+
+    def apply_user_preset(self, data: dict) -> None:
+        if not isinstance(data, dict):
+            raise ValueError("Preset JSON must be an object")
+        converter = data.get("converter")
+        if not isinstance(converter, dict):
+            raise ValueError("Preset does not contain converter settings")
+
+        workflow = str(converter.get("color_workflow") or self.color_workflow)
+        ocio_config_path = str(converter.get("ocio_config_path") or self.ocio_config_path)
+        builtin_ocio_config = str(converter.get("builtin_ocio_config") or self.builtin_ocio_config)
+        self.apply_color_preferences(workflow, ocio_config_path, builtin_ocio_config)
+
+        self._set_combo_data(self.file_type_combo, str(converter.get("file_type") or self.selected_file_type()))
+        self.refresh_output_controls()
+        self._set_combo_data(self.codec_combo, str(converter.get("codec") or self.selected_codec()))
+        self.refresh_profile_controls()
+        self._set_combo_data(self.codec_profile_combo, str(converter.get("profile") or self.selected_profile()))
+
+        self.fps_value_is_manual = bool(converter.get("fps_is_manual", True))
+        self.fps_edit.setText(str(converter.get("fps") or self.fps_edit.text()))
+        self._set_combo_data(self.time_mode_combo, str(converter.get("time_mode") or self.time_mode_combo.currentData()))
+        self.in_edit.setText(str(converter.get("in") or ""))
+        self.out_edit.setText(str(converter.get("out") or ""))
+        self.update_range_markers_from_edits()
+
+        self.preview_pixel_aspect_combo.setCurrentIndex(max(
+            self.preview_pixel_aspect_combo.findData(str(converter.get("pixel_aspect_mode") or PIXEL_ASPECT_AUTO)),
+            0,
+        ))
+        self.manual_pixel_aspect_edit.setText(str(converter.get("manual_par") or "1.0"))
+        self.anamorph_output_combo.setCurrentIndex(max(
+            self.anamorph_output_combo.findData(str(converter.get("pixel_aspect_output") or ANAMORPH_OUTPUT_PRESERVE)),
+            0,
+        ))
+        self.jpg_quality_slider.setValue(int(converter.get("jpg_quality") or self.jpg_quality_slider.value()))
+        self.overwrite_check.setChecked(bool(converter.get("overwrite", False)))
+
+        self.audio_input_edit.setText(str(converter.get("audio_input") or ""))
+        self.refresh_audio_controls()
+        self._set_combo_data(self.audio_format_combo, str(converter.get("audio_format") or self.audio_format_combo.currentData()))
+        self.refresh_audio_profile_controls()
+        self._set_combo_data(self.audio_profile_combo, str(converter.get("audio_profile") or self.audio_profile_combo.currentData()))
+        self.copy_video_add_audio_check.setChecked(bool(converter.get("copy_video_add_audio", False)))
+
+        input_path = str(converter.get("input") or "")
+        self.input_edit_refresh_timer.stop()
+        self.input_edit.setText(input_path)
+        self.input_edit_refresh_timer.stop()
+        if input_path:
+            self.refresh_from_manual_input_path()
+
+        output_path = str(converter.get("output") or "")
+        self.output_edit.setText(output_path)
+        self.output_path_is_manual = bool(converter.get("output_path_is_manual", bool(output_path)))
+
+        self._set_combo_data(self.input_transform_combo, str(converter.get("input_transform") or self.selected_input_transform()))
+        self._set_combo_data(self.output_transform_combo, str(converter.get("output_transform") or self.selected_output_transform()))
+        self.scale_slider.setValue(int(converter.get("scale_slider") or round(float(converter.get("scale") or 1.0) * 1000)))
+        if converter.get("output_width") and converter.get("output_height"):
+            self._set_scale_controls(int(converter["output_width"]), int(converter["output_height"]), self.scale_slider.value() / 1000)
+        self.refresh_video_copy_audio_controls()
+        self.refresh_preview_display_transform()
+        self.refresh_media_info_summary()
+
+    def _default_save_preset_path(self) -> Path:
+        stem = Path(self.output_edit.text().strip()).stem if self.output_edit.text().strip() else "converter_preset"
+        stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", stem).strip("._") or "converter_preset"
+        directory = self._last_directory("last_preset_dir", self.user_presets_dir)
+        return directory / f"{stem}{USER_PRESET_EXTENSION}"
+
+    def _last_directory(self, key: str, fallback: Path | None = None) -> Path:
+        directory = _existing_directory_from_setting(self.app_settings, key)
+        if directory:
+            return directory
+        if fallback and fallback.exists() and fallback.is_dir():
+            return fallback
+        return Path.home()
+
+    def _remember_directory(self, key: str, directory: Path | None) -> None:
+        if directory is None:
+            return
+        path = directory.expanduser()
+        if not path.exists() or not path.is_dir():
+            return
+        self.app_settings[key] = str(path)
+        _write_app_settings(self.app_settings, self.app_config_dir)
+
+    def open_output_folder(self) -> None:
+        output_text = self.output_edit.text().strip()
+        if not output_text:
+            QMessageBox.warning(self, "Open Output Folder failed", "Output path is empty.")
+            return
+        directory = Path(output_text).expanduser().parent
+        if not directory.exists() or not directory.is_dir():
+            QMessageBox.warning(self, "Open Output Folder failed", f"Folder does not exist:\n{directory}")
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory))):
+            self.record_error("Open Output Folder failed", f"Could not open folder: {directory}")
+            QMessageBox.warning(self, "Open Output Folder failed", f"Could not open folder:\n{directory}")
+
     def _build_convert_tab(self) -> None:
         tab = QWidget()
         root = QVBoxLayout(tab)
 
         input_row = QGridLayout()
         self.input_edit = QLineEdit()
+        self.input_edit.setAcceptDrops(True)
+        self.input_edit.installEventFilter(self)
         self.input_edit.textChanged.connect(lambda _text: self.schedule_manual_input_refresh())
         self.input_range_edit = QLineEdit()
         self.input_range_edit.setReadOnly(True)
@@ -1135,7 +1710,9 @@ class MainWindow(QMainWindow):
         self.input_browse_button = QPushButton("Browse")
         self.input_browse_button.clicked.connect(self.browse_input)
         self.audio_input_edit = QLineEdit()
-        self.audio_input_edit.textChanged.connect(lambda _text: self.refresh_audio_controls())
+        self.audio_input_edit.setAcceptDrops(True)
+        self.audio_input_edit.installEventFilter(self)
+        self.audio_input_edit.textChanged.connect(lambda _text: self.handle_audio_input_changed())
         self.audio_input_browse_button = QPushButton("Browse")
         self.audio_input_browse_button.clicked.connect(self.browse_audio_input)
         input_row.addWidget(QLabel("Input"), 0, 0)
@@ -1155,11 +1732,11 @@ class MainWindow(QMainWindow):
         root.addWidget(splitter, stretch=1)
 
         action_row = QHBoxLayout()
-        self.build_button = QPushButton("Copy Command")
-        self.build_button.clicked.connect(self.copy_command)
+        self.add_queue_button = QPushButton("Add to Queue")
+        self.add_queue_button.clicked.connect(self.add_to_queue)
         self.convert_button = QPushButton("Convert Now")
         self.convert_button.clicked.connect(self.convert_now)
-        action_row.addWidget(self.build_button)
+        action_row.addWidget(self.add_queue_button)
         action_row.addWidget(self.convert_button)
         action_row.addStretch(1)
         root.addLayout(action_row)
@@ -1183,10 +1760,12 @@ class MainWindow(QMainWindow):
         panel = QWidget()
         layout = QVBoxLayout(panel)
         self.preview_container = QWidget()
+        self.preview_container.setAcceptDrops(True)
         self.preview_container.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.preview_layout = QVBoxLayout(self.preview_container)
         self.preview_layout.setContentsMargins(0, 0, 0, 0)
         self.preview_placeholder = PreviewLabel("Open a media file to preview")
+        self.preview_placeholder.setAcceptDrops(True)
         self.preview_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_placeholder.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.preview_placeholder.setMinimumHeight(320)
@@ -1303,6 +1882,7 @@ class MainWindow(QMainWindow):
         self.fps_label = QLabel("FPS")
         self.fps_edit = QLineEdit("24")
         self.fps_edit.setPlaceholderText("24")
+        self.fps_edit.textEdited.connect(lambda _text: self.mark_fps_manual())
         self.fps_edit.textChanged.connect(lambda _text: self.refresh_media_info_summary())
         layout.addRow(self.fps_label, self.fps_edit)
 
@@ -1313,10 +1893,7 @@ class MainWindow(QMainWindow):
         self.audio_group = QGroupBox("Audio")
         audio_layout = QFormLayout(self.audio_group)
         self.audio_format_combo = QComboBox()
-        for file_type in ("wav", "mp3", "aac"):
-            self.audio_format_combo.addItem(OUTPUT_OPTIONS[file_type]["label"], file_type)
-        self.audio_format_combo.setCurrentIndex(self.audio_format_combo.findData("aac"))
-        self.audio_format_combo.currentIndexChanged.connect(lambda _index: self.refresh_external_audio_profile_controls())
+        self.audio_format_combo.currentIndexChanged.connect(lambda _index: self.refresh_audio_profile_controls())
         audio_layout.addRow("Audio Format", self.audio_format_combo)
         self.audio_profile_label = QLabel("Audio Profile")
         self.audio_profile_combo = QComboBox()
@@ -1341,7 +1918,7 @@ class MainWindow(QMainWindow):
         self.input_transform_combo = QComboBox()
         self.output_transform_combo = QComboBox()
         self.input_transform_combo.currentIndexChanged.connect(lambda _index: self.refresh_preview_display_transform())
-        self.output_transform_combo.currentIndexChanged.connect(lambda _index: self.refresh_media_info_summary())
+        self.output_transform_combo.currentIndexChanged.connect(lambda _index: self.handle_output_transform_changed())
         layout.addRow("Input Transform", self.input_transform_combo)
         layout.addRow("Output Transform", self.output_transform_combo)
         self.refresh_color_transform_options()
@@ -1388,10 +1965,45 @@ class MainWindow(QMainWindow):
     def _build_queue_tab(self) -> None:
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        self.queue_table = QTableWidget(0, 5)
-        self.queue_table.setHorizontalHeaderLabels(["Input", "Output", "Preset", "Status", "Progress"])
+        self.queue_table = QTableWidget(0, 7)
+        self.queue_table.setHorizontalHeaderLabels([
+            "Active",
+            "Input",
+            "Output",
+            "Preset",
+            "Status",
+            "Progress",
+            "Actions",
+        ])
         self.queue_table.horizontalHeader().setStretchLastSection(True)
+        self.queue_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.queue_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.queue_table.setEditTriggers(
+            QTableWidget.EditTrigger.DoubleClicked
+            | QTableWidget.EditTrigger.SelectedClicked
+            | QTableWidget.EditTrigger.EditKeyPressed
+        )
+        self.queue_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.queue_table.customContextMenuRequested.connect(self.open_queue_context_menu)
+        self.queue_table.itemSelectionChanged.connect(self.refresh_queue_details)
+        self.queue_table.itemChanged.connect(self.handle_queue_item_changed)
         layout.addWidget(self.queue_table)
+
+        self.queue_details_text = QPlainTextEdit()
+        self.queue_details_text.setReadOnly(True)
+        self.queue_details_text.setMinimumHeight(150)
+        layout.addWidget(self.queue_details_text)
+
+        control_row = QHBoxLayout()
+        self.start_queue_button = QPushButton("Start All Jobs")
+        self.start_queue_button.clicked.connect(self.toggle_queue_run)
+        self.cancel_queue_button = QPushButton("Stop")
+        self.cancel_queue_button.clicked.connect(self.cancel_queue)
+        control_row.addWidget(self.start_queue_button)
+        control_row.addWidget(self.cancel_queue_button)
+        control_row.addStretch(1)
+        layout.addLayout(control_row)
+
         self.tabs.addTab(tab, "Queue")
 
     def _build_logs_tab(self) -> None:
@@ -1407,6 +2019,9 @@ class MainWindow(QMainWindow):
         selected = SequenceFileDialog.get_input(self, self._input_dialog_start_dir())
         if not selected:
             return
+        self.apply_selected_input(selected)
+
+    def apply_selected_input(self, selected: SelectedInput) -> None:
         self.input_edit_refresh_timer.stop()
         self.input_edit.blockSignals(True)
         self.input_edit.setText(str(selected.input_path))
@@ -1417,24 +2032,47 @@ class MainWindow(QMainWindow):
         self.current_input_sequence_frame_count = selected.sequence_frame_count
         self.current_input_sequence_start_text = selected.sequence_start_text
         self.current_input_sequence_end_text = selected.sequence_end_text
+        self.current_input_has_audio = False
+        self.fps_value_is_manual = False
         self.input_range_edit.setText(self._selected_range_text())
+        self.refresh_audio_controls()
         self._prepare_preview_source(selected.preview_path, selected.is_sequence)
+        self.refresh_color_transform_defaults()
         if not self.output_path_is_manual or not self.output_edit.text().strip():
             self.output_edit.setText(_default_output_path(
                 selected.input_path,
                 self.current_preset(),
+                output_transform=self.selected_output_transform(),
                 sequence_start=selected.sequence_start,
                 sequence_end=selected.sequence_end,
                 sequence_start_text=selected.sequence_start_text,
                 sequence_end_text=selected.sequence_end_text,
             ))
-        self.refresh_color_transform_defaults()
         self.refresh_fps_control_visibility()
         self.probe_input(selected.preview_path)
+        self._remember_directory("last_video_input_dir", selected.input_path.parent)
+
+    def apply_dropped_file(self, path: Path) -> bool:
+        suffix = path.suffix.lower()
+        if not path.exists() or not path.is_file():
+            QMessageBox.warning(self, "Drop failed", "Drop one file, not a folder.")
+            return True
+        if suffix in AUDIO_INPUT_EXTENSIONS:
+            self.audio_input_edit.setText(str(path))
+            self._remember_directory("last_audio_input_dir", path.parent)
+            return True
+        if suffix in VIDEO_INPUT_EXTENSIONS:
+            self.apply_selected_input(SelectedInput(path, path, False))
+            return True
+        if suffix in STILL_IMAGE_EXTENSIONS:
+            self.apply_selected_input(_selected_input_from_image_file(path))
+            return True
+        QMessageBox.warning(self, "Drop failed", f"Unsupported file type: {suffix or path.name}")
+        return True
 
     def browse_audio_input(self) -> None:
         current = self.audio_input_edit.text().strip()
-        start_path = Path(current).expanduser().parent if current else Path.home()
+        start_path = Path(current).expanduser().parent if current else self._last_directory("last_audio_input_dir", Path.home())
         path, _selected_filter = QFileDialog.getOpenFileName(
             self,
             "Choose audio input",
@@ -1443,12 +2081,25 @@ class MainWindow(QMainWindow):
         )
         if path:
             self.audio_input_edit.setText(path)
+            self._remember_directory("last_audio_input_dir", Path(path).expanduser().parent)
+
+    def handle_audio_input_changed(self) -> None:
+        self.refresh_audio_controls()
+        text = self.audio_input_edit.text().strip()
+        if not text:
+            return
+        path = Path(text).expanduser()
+        if path.exists() and path.is_file():
+            self._remember_directory("last_audio_input_dir", path.parent)
 
     def schedule_manual_input_refresh(self) -> None:
         self.input_edit_refresh_timer.start(120)
 
     def mark_output_path_manual(self) -> None:
         self.output_path_is_manual = bool(self.output_edit.text().strip())
+
+    def mark_fps_manual(self) -> None:
+        self.fps_value_is_manual = bool(self.fps_edit.text().strip())
 
     def refresh_from_manual_input_path(self) -> None:
         input_text = self.input_edit.text().strip()
@@ -1475,13 +2126,17 @@ class MainWindow(QMainWindow):
         self.current_input_sequence_frame_count = len(frames) if frames else None
         self.current_input_sequence_start_text = sequence_start_text
         self.current_input_sequence_end_text = sequence_end_text
+        self.current_input_has_audio = False
+        self.fps_value_is_manual = False
         self.input_range_edit.setText(self._selected_range_text())
+        self.refresh_audio_controls()
         self.refresh_color_transform_defaults()
         self.refresh_fps_control_visibility()
         if not self.output_path_is_manual or not self.output_edit.text().strip():
             self.output_edit.setText(_default_output_path(
                 input_path,
                 self.current_preset(),
+                output_transform=self.selected_output_transform(),
                 sequence_start=sequence_start,
                 sequence_end=sequence_end,
                 sequence_start_text=sequence_start_text,
@@ -1490,7 +2145,8 @@ class MainWindow(QMainWindow):
         preview_path = frames[0] if frames else input_path
         if preview_path.exists():
             self._prepare_preview_source(preview_path, is_sequence=bool(frames))
-            self.probe_input(preview_path)
+            self.probe_input(preview_path, show_errors=False)
+            self._remember_directory("last_video_input_dir", input_path.parent)
 
     def _selected_range_text(self) -> str:
         if not self.current_input_is_sequence:
@@ -1508,28 +2164,70 @@ class MainWindow(QMainWindow):
             path = Path(text).expanduser()
             if path.parent.exists():
                 return path.parent
-        return Path.cwd()
+        return self._last_directory("last_video_input_dir", Path.home())
 
     def browse_output(self) -> None:
-        path, _ = QFileDialog.getSaveFileName(self, "Choose output file")
+        current = self.output_edit.text().strip()
+        start_path = str(Path(current).expanduser()) if current else ""
+        path, _ = QFileDialog.getSaveFileName(self, "Choose output file", start_path)
         if path:
             self.output_edit.setText(path)
             self.output_path_is_manual = True
 
-    def probe_input(self, input_path: Path | None = None) -> None:
+    def probe_input(self, input_path: Path | None = None, *, show_errors: bool = True) -> None:
         input_path = input_path or Path(self.input_edit.text()).expanduser()
         try:
             self.current_probe_json = probe(input_path)
         except Exception as exc:  # noqa: BLE001 - concise UI message.
-            QMessageBox.warning(self, "Analyze failed", str(exc))
+            self.current_probe_json = None
+            self.current_input_has_audio = False
+            self.current_input_unsupported_reason = None
+            self.refresh_audio_controls()
+            if hasattr(self, "summary_text"):
+                self.summary_text.setPlainText(f"Analyze failed:\n{exc}")
+            if hasattr(self, "metadata_table"):
+                self.metadata_table.setRowCount(0)
+            self.progress_label.setText("Analyze failed")
+            self.record_error("Analyze failed", str(exc), traceback_text=traceback.format_exc())
+            if show_errors:
+                QMessageBox.warning(self, "Analyze failed", str(exc))
             return
 
-        self.current_fps = _fps_from_probe(self.current_probe_json) or self.current_fps
+        self.current_input_unsupported_reason = unsupported_ffmpeg_video_reason(self.current_probe_json, input_path)
+        self.current_input_has_audio = _has_audio_stream(self.current_probe_json)
+        probed_fps = _fps_from_probe(self.current_probe_json)
+        if probed_fps:
+            self.current_fps = probed_fps
+        self.refresh_fps_from_input_metadata()
+        self.refresh_audio_controls()
         self.update_source_raster_size(_video_size_from_probe(self.current_probe_json))
         self.refresh_media_info_summary()
         self.refresh_metadata_table(input_path)
         self._sync_video_timeline_from_probe()
+        if self.current_input_unsupported_reason:
+            self.disable_unsupported_video_preview()
         self.tabs.setCurrentIndex(0)
+
+    def disable_unsupported_video_preview(self) -> None:
+        if self.player:
+            self.player.stop()
+            self.player.setSource(QUrl())
+            self.player.deleteLater()
+            self.player = None
+            self.audio_output = None
+        if self.video_sink:
+            self.video_sink.deleteLater()
+            self.video_sink = None
+        self._last_video_source_pixmap = QPixmap()
+        self.sequence_timer.stop()
+        self.position_slider.setEnabled(False)
+        self.play_button.setEnabled(False)
+        self.play_button.setText("Play")
+        self.preview_placeholder.clear()
+        self.preview_placeholder.setText(self.current_input_unsupported_reason or "Unsupported video")
+        self.preview_placeholder.show()
+        if self.preview_layout.indexOf(self.preview_placeholder) == -1:
+            self.preview_layout.addWidget(self.preview_placeholder)
 
     def refresh_media_info_summary(self) -> None:
         if not hasattr(self, "summary_text") or self.current_probe_json is None:
@@ -1542,6 +2240,7 @@ class MainWindow(QMainWindow):
             output_resolution=self.selected_output_raster_size(),
             output_codec=self.selected_output_codec_label(),
             output_color_space=self.selected_output_transform_label(),
+            warning=self.current_input_unsupported_reason,
         ))
 
     def refresh_metadata_table(self, input_path: Path | None = None) -> None:
@@ -1633,23 +2332,64 @@ class MainWindow(QMainWindow):
     def refresh_audio_controls(self) -> None:
         if not hasattr(self, "audio_group"):
             return
-        has_audio_input = self.external_audio_enabled()
-        self.audio_group.setVisible(has_audio_input)
-        self.audio_group.setEnabled(has_audio_input)
-        if has_audio_input and self.audio_profile_combo.count() == 0:
-            self.refresh_external_audio_profile_controls()
-        self.copy_video_add_audio_check.setVisible(self.selected_file_type() == "mp4")
-        self.copy_video_add_audio_check.setEnabled(has_audio_input and self.selected_file_type() == "mp4")
-        if not has_audio_input or self.selected_file_type() != "mp4":
+        mode = self.audio_control_mode()
+        has_audio_controls = mode is not None
+        self.audio_group.setVisible(has_audio_controls)
+        self.audio_group.setEnabled(has_audio_controls)
+        self.refresh_audio_format_options(mode)
+        if has_audio_controls:
+            self.refresh_audio_profile_controls()
+        else:
+            self.audio_profile_label.setVisible(False)
+            self.audio_profile_combo.setVisible(False)
+        external_audio = mode == "external"
+        self.copy_video_add_audio_check.setVisible(external_audio and self.selected_file_type() == "mp4")
+        self.copy_video_add_audio_check.setEnabled(external_audio and self.selected_file_type() == "mp4")
+        if not external_audio or self.selected_file_type() != "mp4":
             self.copy_video_add_audio_check.blockSignals(True)
             self.copy_video_add_audio_check.setChecked(False)
             self.copy_video_add_audio_check.blockSignals(False)
         self.refresh_video_copy_audio_controls()
 
-    def refresh_external_audio_profile_controls(self) -> None:
+    def refresh_audio_format_options(self, mode: str | None = None) -> None:
+        if not hasattr(self, "audio_format_combo"):
+            return
+        mode = mode if mode is not None else self.audio_control_mode()
+        previous_format = self.audio_format_combo.currentData()
+        formats: list[tuple[str, str]] = []
+        if mode == "source":
+            formats.append(("Copy Source Audio", "copy"))
+        if mode in {"external", "source"}:
+            formats.extend((OUTPUT_OPTIONS[file_type]["label"], file_type) for file_type in ("aac", "mp3", "wav"))
+
+        current_values = [self.audio_format_combo.itemData(index) for index in range(self.audio_format_combo.count())]
+        new_values = [value for _label, value in formats]
+        if current_values == new_values:
+            return
+
+        self.audio_format_combo.blockSignals(True)
+        self.audio_format_combo.clear()
+        for label, value in formats:
+            self.audio_format_combo.addItem(label, value)
+        if previous_format in new_values:
+            default_format = str(previous_format)
+        else:
+            default_format = "copy" if mode == "source" else "aac"
+        self.audio_format_combo.setCurrentIndex(max(self.audio_format_combo.findData(default_format), 0))
+        self.audio_format_combo.blockSignals(False)
+
+    def refresh_audio_profile_controls(self) -> None:
         if not hasattr(self, "audio_profile_combo"):
             return
         file_type = self.selected_external_audio_format()
+        if file_type == "copy":
+            self.audio_profile_label.setVisible(False)
+            self.audio_profile_combo.setVisible(False)
+            self.audio_profile_combo.clear()
+            self.refresh_media_info_summary()
+            return
+        self.audio_profile_label.setVisible(True)
+        self.audio_profile_combo.setVisible(True)
         option = OUTPUT_OPTIONS[file_type]
         codec_key = option["default_codec"]
         codec_option = option["codecs"][codec_key]
@@ -1686,37 +2426,40 @@ class MainWindow(QMainWindow):
         self.refresh_scale_controls()
         self.refresh_media_info_summary()
 
+    def handle_output_transform_changed(self) -> None:
+        self.refresh_output_path_extension()
+        self.refresh_media_info_summary()
+
     def refresh_output_path_extension(self) -> None:
+        if not hasattr(self, "output_edit"):
+            return
         if not self.input_edit.text().strip():
             return
         current_output = self.output_edit.text().strip()
         if not current_output:
             self.output_path_is_manual = False
-            self.output_edit.setText(_default_output_path(Path(self.input_edit.text()), self.current_preset()))
+            self.output_edit.setText(_default_output_path(
+                Path(self.input_edit.text()),
+                self.current_preset(),
+                output_transform=self.selected_output_transform(),
+                sequence_start=self.current_input_sequence_start,
+                sequence_end=self.current_input_sequence_end,
+                sequence_start_text=self.current_input_sequence_start_text,
+                sequence_end_text=self.current_input_sequence_end_text,
+            ))
             return
         if self.output_path_is_manual:
             return
         output_path = Path(current_output)
         extension = self.current_preset().output.get("extension", output_path.suffix.lstrip("."))
         input_stem = _clean_sequence_stem(Path(self.input_edit.text()).expanduser().stem)
-        if (
-            not self.current_preset().output.get("requires_pattern")
-            and self.current_input_sequence_start is not None
-            and self.current_input_sequence_end is not None
-        ):
-            input_stem = _stem_with_sequence_range(
-                input_stem,
-                self.current_input_sequence_start,
-                self.current_input_sequence_end,
-                self.current_input_sequence_start_text,
-                self.current_input_sequence_end_text,
-            )
+        transform_suffix = _output_transform_suffix(self.selected_output_transform())
+        if transform_suffix:
+            input_stem = f"{input_stem}_{transform_suffix}"
         if self.current_preset().output.get("requires_pattern"):
-            stem = input_stem if self.current_input_sequence_start is not None else output_path.stem.split(".")[0]
-            self.output_edit.setText(str(output_path.with_name(f"{stem}.%04d.{extension}")))
+            self.output_edit.setText(str(output_path.with_name(f"{input_stem}.%04d.{extension}")))
         else:
-            stem = input_stem if self.current_input_sequence_start is not None else _clean_sequence_stem(output_path.stem)
-            self.output_edit.setText(str(output_path.with_name(f"{stem}.{extension}")))
+            self.output_edit.setText(str(output_path.with_name(f"{input_stem}.{extension}")))
 
     def selected_file_type(self) -> str:
         return str(self.file_type_combo.currentData())
@@ -1729,6 +2472,27 @@ class MainWindow(QMainWindow):
 
     def external_audio_enabled(self) -> bool:
         return bool(hasattr(self, "audio_input_edit") and self.audio_input_edit.text().strip())
+
+    def input_is_video_file(self) -> bool:
+        input_text = self.input_edit.text().strip()
+        if not input_text or self.input_is_sequence():
+            return False
+        return Path(input_text).expanduser().suffix.lower() in VIDEO_INPUT_EXTENSIONS
+
+    def source_audio_controls_enabled(self) -> bool:
+        return (
+            not self.external_audio_enabled()
+            and self.selected_file_type() in VIDEO_OUTPUT_FILE_TYPES
+            and self.input_is_video_file()
+            and self.current_input_has_audio
+        )
+
+    def audio_control_mode(self) -> str | None:
+        if self.external_audio_enabled():
+            return "external"
+        if self.source_audio_controls_enabled():
+            return "source"
+        return None
 
     def selected_external_audio_format(self) -> str:
         return str(self.audio_format_combo.currentData() or "aac")
@@ -1746,10 +2510,19 @@ class MainWindow(QMainWindow):
 
     def selected_external_audio_settings(self) -> dict:
         file_type = self.selected_external_audio_format()
+        return self.selected_audio_settings(file_type, self.selected_external_audio_profile(), shortest=True)
+
+    def selected_embedded_audio_settings(self) -> dict:
+        file_type = self.selected_external_audio_format()
+        if file_type == "copy":
+            return {"enabled": True, "codec": "copy"}
+        return self.selected_audio_settings(file_type, self.selected_external_audio_profile(), shortest=False)
+
+    def selected_audio_settings(self, file_type: str, profile_key: str, *, shortest: bool) -> dict:
         option = OUTPUT_OPTIONS[file_type]
         codec_key = option["default_codec"]
         codec_option = option["codecs"][codec_key]
-        profile_key = self.selected_external_audio_profile() or codec_option["default_profile"]
+        profile_key = profile_key or codec_option["default_profile"]
         profile_option = codec_option["profiles"].get(profile_key) or codec_option["profiles"][codec_option["default_profile"]]
         audio = deepcopy(get_preset(codec_option["preset"]).audio)
         if "audio_codec" in profile_option:
@@ -1758,7 +2531,7 @@ class MainWindow(QMainWindow):
             audio["sample_rate"] = profile_option["sample_rate"]
         if "bitrate" in profile_option:
             audio["bitrate"] = profile_option["bitrate"]
-        audio["shortest"] = True
+        audio["shortest"] = shortest
         return audio
 
     def selected_input_transform(self) -> str:
@@ -1869,6 +2642,10 @@ class MainWindow(QMainWindow):
             video["quality"] = profile_option["quality"]
         if "encoder_options" in profile_option:
             video["encoder_options"] = deepcopy(profile_option["encoder_options"])
+        if profile_option.get("gif_palette"):
+            video["palette"] = True
+            video["palettegen"] = deepcopy(profile_option.get("palettegen", {}))
+            video["paletteuse"] = deepcopy(profile_option.get("paletteuse", {}))
         if file_type == "jpg":
             video["quality"] = _jpeg_quality_percent_to_qscale(self.jpg_quality_slider.value())
         if "audio_codec" in profile_option:
@@ -1879,9 +2656,14 @@ class MainWindow(QMainWindow):
             audio["bitrate"] = profile_option["bitrate"]
 
         external_audio = self.external_audio_enabled()
+        source_audio = self.source_audio_controls_enabled()
         mux_without_video_encode = self.video_copy_audio_mux_enabled()
         if external_audio:
             audio = self.selected_external_audio_settings()
+        elif source_audio:
+            audio = self.selected_embedded_audio_settings()
+        elif file_type in VIDEO_OUTPUT_FILE_TYPES and self.input_is_video_file():
+            audio = {"enabled": False}
         if mux_without_video_encode:
             video = {"enabled": True, "codec": "copy"}
             filters = {
@@ -1950,7 +2732,20 @@ class MainWindow(QMainWindow):
     def should_show_fps_control(self) -> bool:
         file_type = self.selected_file_type()
         output_is_sequence = bool(OUTPUT_OPTIONS[file_type].get("sequence"))
-        return self.input_is_sequence() and not output_is_sequence
+        return file_type in FPS_OUTPUT_FILE_TYPES and not output_is_sequence
+
+    def refresh_fps_from_input_metadata(self) -> None:
+        if not hasattr(self, "fps_edit"):
+            return
+        if self.fps_value_is_manual:
+            return
+        value = 24.0 if self.input_is_sequence() else self.current_fps
+        if value <= 0:
+            return
+        text = _format_summary_fps(value, None)
+        self.fps_edit.blockSignals(True)
+        self.fps_edit.setText(text)
+        self.fps_edit.blockSignals(False)
 
     def input_is_sequence(self) -> bool:
         if self.current_input_is_sequence:
@@ -1961,6 +2756,7 @@ class MainWindow(QMainWindow):
         return sequence_start_number(Path(input_text).expanduser()) is not None
 
     def refresh_fps_control_visibility(self) -> None:
+        self.refresh_fps_from_input_metadata()
         show_fps = self.should_show_fps_control()
         self.fps_label.setVisible(show_fps)
         self.fps_edit.setVisible(show_fps)
@@ -2160,40 +2956,306 @@ class MainWindow(QMainWindow):
         try:
             command = build_ffmpeg_args(self.build_job())
         except Exception as exc:  # noqa: BLE001
+            self.record_error("Copy failed", str(exc), traceback_text=traceback.format_exc())
             QMessageBox.warning(self, "Copy failed", str(exc))
             return
         QApplication.clipboard().setText(format_command(command))
         self.progress_label.setText("Command copied")
 
+    def create_queue_snapshot(self) -> QueueJobSnapshot:
+        job = self.build_job()
+        command = build_ffmpeg_args(job)
+        return QueueJobSnapshot(
+            job=job,
+            command=command,
+            details=self.queue_job_details(job, command),
+        )
+
+    def add_to_queue(self) -> None:
+        try:
+            snapshot = self.create_queue_snapshot()
+        except Exception as exc:  # noqa: BLE001
+            self.record_error("Add to Queue failed", str(exc), traceback_text=traceback.format_exc())
+            QMessageBox.warning(self, "Add to Queue failed", str(exc))
+            return
+        row = self._append_queue_snapshot(snapshot)
+        self.queue_table.selectRow(row)
+        self.tabs.setCurrentIndex(2)
+        self.progress_label.setText("Added to Queue")
+
+    def _append_queue_snapshot(self, snapshot: QueueJobSnapshot, status: str = "Queued") -> int:
+        row = self.queue_table.rowCount()
+        self.queue_jobs.append(snapshot)
+        self._updating_queue_table = True
+        try:
+            self.queue_table.insertRow(row)
+
+            active_item = QTableWidgetItem()
+            active_item.setFlags(
+                Qt.ItemFlag.ItemIsUserCheckable
+                | Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsSelectable
+            )
+            active_item.setCheckState(Qt.CheckState.Checked)
+            self.queue_table.setItem(row, QUEUE_COL_ACTIVE, active_item)
+
+            values = {
+                QUEUE_COL_INPUT: str(snapshot.job.input),
+                QUEUE_COL_OUTPUT: str(snapshot.job.output),
+                QUEUE_COL_PRESET: snapshot.job.preset.id,
+                QUEUE_COL_STATUS: status,
+                QUEUE_COL_PROGRESS: "0%",
+                QUEUE_COL_ACTIONS: "",
+            }
+            for column, value in values.items():
+                self.queue_table.setItem(row, column, self._queue_table_item(value, editable=column == QUEUE_COL_OUTPUT))
+            self.queue_table.resizeColumnsToContents()
+        finally:
+            self._updating_queue_table = False
+        return row
+
+    def _queue_table_item(self, value: str, editable: bool = False) -> QTableWidgetItem:
+        item = QTableWidgetItem(value)
+        if editable:
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
+        else:
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        return item
+
+    def queue_job_details(self, job: ConvertJob, command: list[str]) -> str:
+        filters = job.preset.filters
+        video = job.preset.video
+        audio = job.preset.audio
+        output_size = "source"
+        scale = filters.get("scale")
+        if isinstance(scale, dict) and scale.get("mode") == "dimensions":
+            output_size = f"{scale.get('width')} x {scale.get('height')} px"
+        return "\n".join([
+            f"Input: {job.input}",
+            f"Audio Input: {job.audio_input if job.audio_input else '-'}",
+            f"Output: {job.output}",
+            f"Preset: {job.preset.name} ({job.preset.id})",
+            f"Container: {job.preset.output.get('container', 'unknown')}",
+            f"Video Codec: {video.get('codec', 'disabled') if video.get('enabled', True) else 'disabled'}",
+            f"Audio Codec: {audio.get('codec', 'disabled') if audio.get('enabled', True) else 'disabled'}",
+            f"Audio Bitrate: {audio.get('bitrate', '-')}",
+            f"Audio Sample Rate: {audio.get('sample_rate', '-')}",
+            f"FPS: {filters.get('fps', 'source')}",
+            f"In: {job.in_point or '-'}",
+            f"Out: {job.out_point or '-'}",
+            f"Scale: {scale}",
+            f"Output Size: {output_size}",
+            f"Pixel Aspect: {filters.get('output_pixel_aspect', '1.0')}",
+            f"Pixel Aspect Output: {filters.get('anamorph_output', '-')}",
+            f"Color Management: {self.color_workflow}",
+            f"Input Transform: {_log_transform_value(filters, 'input')}",
+            f"Output Transform: {_log_transform_value(filters, 'output')}",
+            f"Copy Video + External Audio: {bool(filters.get('copy_video_with_external_audio'))}",
+            "",
+            "FFmpeg Command:",
+            format_command(command),
+        ])
+
+    def refresh_queue_details(self) -> None:
+        selected_rows = sorted({index.row() for index in self.queue_table.selectedIndexes()})
+        if not selected_rows:
+            self.queue_details_text.clear()
+            return
+        row = selected_rows[0]
+        if 0 <= row < len(self.queue_jobs):
+            self.queue_details_text.setPlainText(self.queue_jobs[row].details)
+
+    def handle_queue_item_changed(self, item: QTableWidgetItem) -> None:
+        if self._updating_queue_table or item.column() != QUEUE_COL_OUTPUT:
+            return
+        row = item.row()
+        if not (0 <= row < len(self.queue_jobs)):
+            return
+        if self._queue_status(row) == "Running":
+            self._reset_queue_output_item(row)
+            QMessageBox.warning(self, "Output is locked", "Cannot edit output while the job is running.")
+            return
+        output_text = item.text().strip()
+        if not output_text:
+            self._reset_queue_output_item(row)
+            QMessageBox.warning(self, "Output is required", "Output path cannot be empty.")
+            return
+        snapshot = self.queue_jobs[row]
+        job = replace(snapshot.job, output=Path(output_text).expanduser(), overwrite=False)
+        if same_input_and_output(job.input, job.output):
+            self._reset_queue_output_item(row)
+            QMessageBox.warning(self, "Invalid output", "Output path must be different from input path.")
+            return
+        command = build_ffmpeg_args(job)
+        self.queue_jobs[row] = QueueJobSnapshot(
+            job=job,
+            command=command,
+            details=self.queue_job_details(job, command),
+        )
+        if self._queue_status(row) in {"Finished", "Failed", "Cancelled"}:
+            self._set_queue_status(row, "Queued")
+            self.queue_table.setItem(row, QUEUE_COL_PROGRESS, self._queue_table_item("0%"))
+            self._set_queue_row_active(row, True)
+        self.refresh_queue_details()
+
+    def _reset_queue_output_item(self, row: int) -> None:
+        self._updating_queue_table = True
+        try:
+            self.queue_table.setItem(
+                row,
+                QUEUE_COL_OUTPUT,
+                self._queue_table_item(str(self.queue_jobs[row].job.output), editable=True),
+            )
+        finally:
+            self._updating_queue_table = False
+
+    def open_queue_context_menu(self, position: QPoint) -> None:
+        index = self.queue_table.indexAt(position)
+        if index.isValid():
+            self.queue_table.selectRow(index.row())
+        menu = QMenu(self)
+        delete_action = menu.addAction("Delete Job")
+        delete_action.setEnabled(index.isValid())
+        delete_action.triggered.connect(lambda: self.delete_queue_row(index.row()))
+        menu.exec(self.queue_table.viewport().mapToGlobal(position))
+
+    def delete_queue_row(self, row: int) -> None:
+        if self.current_worker is not None and self.current_worker.isRunning():
+            QMessageBox.warning(self, "Queue is running", "Stop the active conversion before deleting jobs.")
+            return
+        if not (0 <= row < len(self.queue_jobs)):
+            return
+        del self.queue_jobs[row]
+        self.queue_table.removeRow(row)
+        self.refresh_queue_details()
+
     def convert_now(self) -> None:
         try:
-            job = self.build_job()
-            if output_exists_for_job(job) and not job.overwrite:
-                if not self.confirm_overwrite(job):
-                    self.progress_label.setText("Cancelled")
-                    return
-                job = replace(job, overwrite=True)
-            build_ffmpeg_args(job)
+            snapshot = self.create_queue_snapshot()
         except Exception as exc:  # noqa: BLE001
+            self.record_error("Convert failed", str(exc), traceback_text=traceback.format_exc())
             QMessageBox.warning(self, "Convert failed", str(exc))
             return
+        row = self._append_queue_snapshot(snapshot, status="Queued")
+        self.queue_table.selectRow(row)
+        self._start_queue_row(row, continue_queue=False)
 
-        row = self.queue_table.rowCount()
-        self.queue_table.insertRow(row)
-        for column, value in enumerate([str(job.input), str(job.output), job.preset.id, "Running", "0%"]):
-            self.queue_table.setItem(row, column, QTableWidgetItem(value))
+    def toggle_queue_run(self) -> None:
+        if self.current_worker is not None and self.current_worker.isRunning():
+            self.queue_pause_requested = True
+            self.queue_run_all_active = False
+            self.start_queue_button.setText("Start All Jobs")
+            self.progress_label.setText("Pause requested")
+            return
+        self.queue_cancel_requested = False
+        self.queue_pause_requested = False
+        self.queue_run_all_active = True
+        self.start_queue_button.setText("Pause")
+        self._start_next_active_queue_job()
+
+    def cancel_queue(self) -> None:
+        if self.current_worker is not None and self.current_worker.isRunning():
+            result = QMessageBox.question(
+                self,
+                "Stop conversion?",
+                "Stop the active conversion?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if result != QMessageBox.StandardButton.Yes:
+                return
+            self.queue_cancel_requested = True
+            self.queue_run_all_active = False
+            self.current_worker.cancel()
+            self.progress_label.setText("Stop requested")
+            return
+        self.queue_run_all_active = False
+        self.queue_pause_requested = False
+        self.start_queue_button.setText("Start All Jobs")
+        self.progress_label.setText("Queue stopped")
+
+    def _start_next_active_queue_job(self) -> None:
+        for row in range(self.queue_table.rowCount()):
+            if not self._queue_row_is_active(row):
+                continue
+            status = self._queue_status(row)
+            if status == "Queued":
+                self._start_queue_row(row, continue_queue=True)
+                return
+        self.queue_run_all_active = False
+        self.start_queue_button.setText("Start All Jobs")
+        self.progress_label.setText("Queue finished")
+
+    def _start_queue_row(self, row: int, continue_queue: bool) -> None:
+        if self.current_worker is not None and self.current_worker.isRunning():
+            QMessageBox.warning(self, "Queue busy", "A conversion is already running.")
+            return
+        if not (0 <= row < len(self.queue_jobs)):
+            return
+        snapshot = self.queue_jobs[row]
+        job = snapshot.job
+        unsupported_reason = self.unsupported_input_reason_for_job(job)
+        if unsupported_reason:
+            self._set_queue_status(row, "Failed")
+            self.queue_table.setItem(row, QUEUE_COL_PROGRESS, self._queue_table_item("0%"))
+            self._set_queue_row_active(row, False)
+            self.progress_label.setText("Unsupported input")
+            QMessageBox.warning(self, "Unsupported input", unsupported_reason)
+            if continue_queue:
+                QTimer.singleShot(0, self._start_next_active_queue_job)
+            return
+        if output_exists_for_job(job) and not job.overwrite:
+            if not self.confirm_overwrite(job):
+                self._set_queue_status(row, "Cancelled")
+                self.progress_label.setText("Cancelled")
+                if continue_queue:
+                    QTimer.singleShot(0, self._start_next_active_queue_job)
+                return
+            job = replace(job, overwrite=True)
+            command = build_ffmpeg_args(job)
+            snapshot = QueueJobSnapshot(
+                job=job,
+                command=command,
+                details=self.queue_job_details(job, command),
+            )
+            self.queue_jobs[row] = snapshot
+            self.refresh_queue_details()
 
         log_path = Path("logs") / f"{job.output.stem}.log"
         self.progress_bar.setValue(0)
         self.progress_label.setText("Running")
+        self._set_queue_status(row, "Running")
+        self.queue_table.setItem(row, QUEUE_COL_PROGRESS, self._queue_table_item("0%"))
         self.tabs.setCurrentIndex(3)
 
         self.current_worker = ConvertWorker(job, log_path)
         self.current_worker.progress_changed.connect(lambda value, status: self._update_progress(row, value, status))
         self.current_worker.log_line.connect(self.append_log)
-        self.current_worker.finished_with_code.connect(lambda code: self._conversion_finished(row, code))
-        self.current_worker.failed.connect(lambda message: self._conversion_failed(row, message))
+        self.current_worker.finished_with_code.connect(lambda code: self._conversion_finished(row, code, continue_queue))
+        self.current_worker.failed.connect(lambda message, trace: self._conversion_failed(row, message, continue_queue, trace))
         self.current_worker.start()
+
+    def unsupported_input_reason_for_job(self, job: ConvertJob) -> str | None:
+        try:
+            return unsupported_ffmpeg_video_reason(probe(job.input), job.input)
+        except Exception:
+            return None
+
+    def _queue_row_is_active(self, row: int) -> bool:
+        item = self.queue_table.item(row, QUEUE_COL_ACTIVE)
+        return bool(item and item.checkState() == Qt.CheckState.Checked)
+
+    def _queue_status(self, row: int) -> str:
+        item = self.queue_table.item(row, QUEUE_COL_STATUS)
+        return item.text() if item else ""
+
+    def _set_queue_status(self, row: int, status: str) -> None:
+        self.queue_table.setItem(row, QUEUE_COL_STATUS, self._queue_table_item(status))
+
+    def _set_queue_row_active(self, row: int, active: bool) -> None:
+        item = self.queue_table.item(row, QUEUE_COL_ACTIVE)
+        if item:
+            item.setCheckState(Qt.CheckState.Checked if active else Qt.CheckState.Unchecked)
 
     def confirm_overwrite(self, job: ConvertJob) -> bool:
         if "%" in job.output.name:
@@ -2213,19 +3275,56 @@ class MainWindow(QMainWindow):
         percent = max(0, min(100, int(value)))
         self.progress_bar.setValue(percent)
         self.progress_label.setText(status)
-        self.queue_table.setItem(row, 4, QTableWidgetItem(f"{percent}%"))
+        self.queue_table.setItem(row, QUEUE_COL_PROGRESS, self._queue_table_item(f"{percent}%"))
+        if percent >= 100:
+            self._set_queue_row_active(row, False)
 
-    def _conversion_finished(self, row: int, code: int) -> None:
-        status = "Finished" if code == 0 else f"Failed ({code})"
+    def _conversion_finished(self, row: int, code: int, continue_queue: bool = False) -> None:
+        if self.queue_cancel_requested:
+            status = "Cancelled"
+        else:
+            status = "Finished" if code == 0 else f"Failed ({code})"
         self.progress_label.setText(status)
-        self.queue_table.setItem(row, 3, QTableWidgetItem(status))
+        self._set_queue_status(row, status)
+        if status == "Finished":
+            self._set_queue_row_active(row, False)
         self.append_log("")
         self.append_log(status)
+        self.current_worker = None
+        if continue_queue and self.queue_run_all_active and not self.queue_pause_requested and not self.queue_cancel_requested:
+            QTimer.singleShot(0, self._start_next_active_queue_job)
+            return
+        self.queue_run_all_active = False
+        self.queue_pause_requested = False
+        self.queue_cancel_requested = False
+        self.start_queue_button.setText("Start All Jobs")
 
-    def _conversion_failed(self, row: int, message: str) -> None:
+    def _conversion_failed(
+        self,
+        row: int,
+        message: str,
+        continue_queue: bool = False,
+        traceback_text: str | None = None,
+    ) -> None:
         self.progress_label.setText("Failed")
-        self.queue_table.setItem(row, 3, QTableWidgetItem("Failed"))
+        self._set_queue_status(row, "Failed")
         self.append_log(f"ERROR: {message}")
+        snapshot = self.queue_jobs[row] if 0 <= row < len(self.queue_jobs) else None
+        self.record_error(
+            "Convert failed",
+            message,
+            job=snapshot.job if snapshot else None,
+            command=snapshot.command if snapshot else None,
+            traceback_text=traceback_text,
+        )
+        self.current_worker = None
+        if continue_queue and self.queue_run_all_active and not self.queue_pause_requested and not self.queue_cancel_requested:
+            QTimer.singleShot(0, self._start_next_active_queue_job)
+            return
+        self.queue_run_all_active = False
+        self.queue_pause_requested = False
+        self.queue_cancel_requested = False
+        self.start_queue_button.setText("Start All Jobs")
         QMessageBox.warning(self, "Convert failed", message)
 
     def append_log(self, line: str) -> None:
@@ -2493,12 +3592,56 @@ class MainWindow(QMainWindow):
             return
         super().keyPressEvent(event)
 
+    def dragEnterEvent(self, event) -> None:  # noqa: ANN001 - Qt event type differs by binding version.
+        if _single_local_file_from_drop_event(event) is not None:
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event) -> None:  # noqa: ANN001 - Qt event type differs by binding version.
+        if _single_local_file_from_drop_event(event) is not None:
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event) -> None:  # noqa: ANN001 - Qt event type differs by binding version.
+        path = _single_local_file_from_drop_event(event)
+        if path is None:
+            QMessageBox.warning(self, "Drop failed", "Drop one local file.")
+            return
+        if self.apply_dropped_file(path):
+            event.acceptProposedAction()
+
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if event.type() in {QEvent.Type.DragEnter, QEvent.Type.DragMove}:
+            if _single_local_file_from_drop_event(event) is not None:
+                event.acceptProposedAction()
+                return True
+        if event.type() == QEvent.Type.Drop:
+            path = _single_local_file_from_drop_event(event)
+            if path is not None:
+                self.apply_dropped_file(path)
+                event.acceptProposedAction()
+                return True
+            mime_data = event.mimeData() if hasattr(event, "mimeData") else None
+            if mime_data is not None and mime_data.hasUrls():
+                QMessageBox.warning(self, "Drop failed", "Drop one local file.")
+                event.acceptProposedAction()
+                return True
         if event.type() == QEvent.Type.KeyPress and isinstance(event, QKeyEvent):
             return self._handle_preview_key(event)
         return super().eventFilter(watched, event)
 
     def _handle_preview_key(self, event: QKeyEvent) -> bool:
+        if event.modifiers() in {Qt.KeyboardModifier.NoModifier, Qt.KeyboardModifier.ShiftModifier}:
+            if event.key() == Qt.Key.Key_I:
+                self.set_in_point()
+                event.accept()
+                return True
+            if event.key() == Qt.Key.Key_O:
+                self.set_out_point()
+                event.accept()
+                return True
         key_steps = {
             Qt.Key.Key_Left: -1,
             Qt.Key.Key_Right: 1,
@@ -3145,6 +4288,7 @@ def _fraction_to_float(value: object) -> float | None:
 def _default_output_path(
     input_path: Path,
     preset: Preset,
+    output_transform: str | None = None,
     sequence_start: int | None = None,
     sequence_end: int | None = None,
     sequence_start_text: str | None = None,
@@ -3152,27 +4296,30 @@ def _default_output_path(
 ) -> str:
     extension = preset.output.get("extension", "mp4")
     stem = _clean_sequence_stem(input_path.stem)
-    if not preset.output.get("requires_pattern") and sequence_start is not None and sequence_end is not None:
-        stem = _stem_with_sequence_range(stem, sequence_start, sequence_end, sequence_start_text, sequence_end_text)
+    transform_suffix = _output_transform_suffix(output_transform)
+    if transform_suffix:
+        stem = f"{stem}_{transform_suffix}"
     if preset.output.get("requires_pattern"):
         return str(input_path.with_name(f"{stem}.%04d.{extension}"))
-    return str(input_path.with_name(f"{stem}_{preset.id}.{extension}"))
-
-
-def _stem_with_sequence_range(
-    stem: str,
-    sequence_start: int,
-    sequence_end: int,
-    sequence_start_text: str | None = None,
-    sequence_end_text: str | None = None,
-) -> str:
-    start = sequence_start_text or str(sequence_start)
-    end = sequence_end_text or str(sequence_end)
-    return f"{stem}_{start}-{end}"
+    return str(input_path.with_name(f"{stem}.{extension}"))
 
 
 def _clean_sequence_stem(stem: str) -> str:
-    return re.sub(r"[_\-.]?%0?\d*d", "", stem).rstrip("_-.") or stem
+    cleaned = re.sub(r"[_\-.]?%0?\d*d", "", stem).rstrip("_-.")
+    cleaned = re.sub(r"[_\-.]?\d{3,}-\d{3,}$", "", cleaned).rstrip("_-.")
+    return cleaned or stem
+
+
+def _output_transform_suffix(output_transform: str | None) -> str | None:
+    if not output_transform:
+        return None
+    value = output_transform.strip()
+    if value.startswith("ocio:"):
+        value = value.removeprefix("ocio:")
+    value = value.lower()
+    value = value.replace("rec.709", "rec709").replace("rec 709", "rec709")
+    value = re.sub(r"[^a-z0-9]+", "_", value).strip("_")
+    return value or None
 
 
 def _media_summary(
@@ -3183,6 +4330,7 @@ def _media_summary(
     output_resolution: QSize | None = None,
     output_codec: str | None = None,
     output_color_space: str | None = None,
+    warning: str | None = None,
 ) -> str:
     lines: list[str] = ["Input"]
     fmt = probe_json.get("format", {})
@@ -3205,6 +4353,8 @@ def _media_summary(
         ))
         lines.append(f"Size: {_format_file_size(_summary_size_value(fmt.get('size'), input_path))}")
     lines.append(f"Created by: {_summary_created_by(probe_json, input_path)}")
+    if warning:
+        lines.append(f"Warning: {warning}")
 
     if audio_stream:
         lines.append("")
@@ -3233,12 +4383,23 @@ def _first_stream(probe_json: dict, stream_type: str) -> dict | None:
     return None
 
 
+def _has_audio_stream(probe_json: dict | None) -> bool:
+    return bool(probe_json and _first_stream(probe_json, "audio") is not None)
+
+
 def _stream_resolution(stream: dict | None) -> str | None:
     if not stream:
         return None
     width = stream.get("width")
     height = stream.get("height")
     if width is None or height is None:
+        return None
+    try:
+        width_value = int(width)
+        height_value = int(height)
+    except (TypeError, ValueError):
+        return None
+    if width_value <= 0 or height_value <= 0:
         return None
     return f"{width} x {height} px"
 
@@ -3370,6 +4531,174 @@ def _metadata_source_path(input_path: Path | None) -> Path | None:
     if input_path.exists():
         return input_path
     return None
+
+
+def _error_report(
+    title: str,
+    message: str,
+    *,
+    config_dir: Path,
+    input_path: Path | None = None,
+    output_path: Path | None = None,
+    file_type: str | None = None,
+    codec: str | None = None,
+    input_transform: str | None = None,
+    output_transform: str | None = None,
+    command: list[str] | None = None,
+    traceback_text: str | None = None,
+) -> str:
+    lines = [
+        f"{APP_DISPLAY_NAME} error report",
+        "",
+        f"Time: {time.strftime('%Y-%m-%d %H:%M:%S %Z')}",
+        f"Version: {__version__}",
+        f"OS: {platform.platform()}",
+        f"Python: {platform.python_version()}",
+        f"Qt/PySide6: {qVersion()}",
+        f"FFmpeg: {_tool_status('ffmpeg')}",
+        f"FFprobe: {_tool_status('ffprobe')}",
+        f"Config: {config_dir}",
+        f"Error log: {_app_error_log_path(config_dir)}",
+        "",
+        "Converter state:",
+        f"Input: {input_path or '-'}",
+        f"Output: {output_path or '-'}",
+        f"File Type: {file_type or '-'}",
+        f"Codec: {codec or '-'}",
+        f"Input Transform: {input_transform or '-'}",
+        f"Output Transform: {output_transform or '-'}",
+        "",
+        "Error:",
+        f"{title}: {message}",
+    ]
+    if command:
+        lines.extend(("", "Last FFmpeg Command:", format_command(command)))
+    if traceback_text:
+        lines.extend(("", "Traceback:", traceback_text.strip()))
+    return "\n".join(lines).strip() + "\n"
+
+
+def _append_error_log(report: str, config_dir: Path | None = None) -> None:
+    try:
+        path = _app_error_log_path(config_dir)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(report)
+            handle.write("\n" + "=" * 80 + "\n\n")
+    except Exception:
+        return
+
+
+def _tool_status(name: str) -> str:
+    path = shutil.which(name)
+    return path or "not found"
+
+
+def _python_module_status(name: str) -> str:
+    try:
+        module = __import__(name)
+    except Exception:  # noqa: BLE001 - optional dependency status only.
+        return "not available"
+    version = getattr(module, "__version__", None)
+    return str(version) if version else "available"
+
+
+def _latest_github_version(owner: str, repo: str) -> tuple[str | None, str | None]:
+    release_url = f"https://api.github.com/repos/{owner}/{repo}/releases/latest"
+    try:
+        release = _github_json(release_url)
+        tag = str(release.get("tag_name") or "").strip()
+        url = str(release.get("html_url") or "").strip()
+        if tag:
+            return tag, url
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            raise RuntimeError(f"GitHub update check failed: HTTP {exc.code}") from exc
+
+    best_tag = _latest_github_api_tag(owner, repo) or _latest_git_remote_tag(owner, repo)
+    if not best_tag:
+        return None, None
+    return best_tag, f"https://github.com/{owner}/{repo}/releases/tag/{best_tag}"
+
+
+def _latest_github_api_tag(owner: str, repo: str) -> str | None:
+    tags_url = f"https://api.github.com/repos/{owner}/{repo}/tags?per_page=20"
+    try:
+        tags = _github_json(tags_url)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        raise RuntimeError(f"GitHub update check failed: HTTP {exc.code}") from exc
+    if not isinstance(tags, list):
+        return None
+    return _best_version_tag(str(item.get("name") or "").strip() for item in tags if isinstance(item, dict))
+
+
+def _latest_git_remote_tag(owner: str, repo: str) -> str | None:
+    remote_url = f"https://github.com/{owner}/{repo}.git"
+    try:
+        completed = subprocess.run(
+            ["git", "ls-remote", "--tags", "--refs", remote_url],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    tags: list[str] = []
+    for line in completed.stdout.splitlines():
+        _sha, _separator, ref = line.partition("\t")
+        if ref.startswith("refs/tags/"):
+            tags.append(ref.removeprefix("refs/tags/"))
+    return _best_version_tag(tags)
+
+
+def _best_version_tag(tags) -> str | None:  # noqa: ANN001 - accepts any iterable of strings.
+    best_tag = ""
+    for tag in tags:
+        tag = str(tag).strip()
+        if tag and (not best_tag or _version_is_newer(tag, best_tag)):
+            best_tag = tag
+    return best_tag or None
+
+
+def _github_json(url: str):
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": f"7th-vfx-convertor/{__version__}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:  # noqa: S310 - fixed GitHub API URL.
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError:
+        raise
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Could not reach GitHub: {exc.reason}") from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("GitHub returned invalid JSON.") from exc
+
+
+def _version_is_newer(candidate: str, current: str) -> bool:
+    candidate_parts = _version_parts(candidate)
+    current_parts = _version_parts(current)
+    max_len = max(len(candidate_parts), len(current_parts), 1)
+    candidate_parts.extend([0] * (max_len - len(candidate_parts)))
+    current_parts.extend([0] * (max_len - len(current_parts)))
+    return candidate_parts > current_parts
+
+
+def _version_parts(value: str) -> list[int]:
+    normalized = value.strip().lower().removeprefix("v")
+    parts: list[int] = []
+    for match in re.finditer(r"\d+", normalized):
+        parts.append(int(match.group(0)))
+    return parts or [0]
 
 
 def _openexr_metadata_rows(path: Path) -> list[tuple[str, str, str, str]]:

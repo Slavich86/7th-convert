@@ -1,0 +1,23 @@
+{
+  "id": "dpx_sequence",
+  "name": "DPX Sequence",
+  "group": "Image Sequence",
+  "output": {
+    "container": "image2",
+    "extension": "dpx",
+    "requires_pattern": true
+  },
+  "video": {
+    "enabled": true,
+    "codec": "dpx",
+    "pix_fmt": "gbrp10be"
+  },
+  "audio": {
+    "enabled": false
+  },
+  "filters": {
+    "scale": "keep",
+    "fps": "source",
+    "force_even_dimensions": false
+  }
+}

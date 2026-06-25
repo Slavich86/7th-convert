@@ -8,7 +8,14 @@
   },
   "video": {
     "enabled": true,
-    "codec": "gif"
+    "codec": "gif",
+    "palette": true,
+    "palettegen": {
+      "stats_mode": "diff"
+    },
+    "paletteuse": {
+      "dither": "sierra2_4a"
+    }
   },
   "audio": {
     "enabled": false

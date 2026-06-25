@@ -29,6 +29,7 @@ logs/
 # Local planning and agent instructions
 AGENTS.md
 plan.md
+GITHUB_RULES.md
 ref/
 tests/
 icon/

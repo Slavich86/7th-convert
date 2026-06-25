@@ -8,6 +8,7 @@ from pathlib import Path
 from .command_builder import ConvertJob, build_ffmpeg_args
 from .exr_metadata import preserve_exr_metadata_for_job
 from .ffprobe import duration_seconds, probe
+from .media_support import unsupported_ffmpeg_video_reason
 from .sequence import sequence_frames, sequence_pattern_has_frames
 
 
@@ -36,6 +37,9 @@ def output_exists_for_job(job: ConvertJob) -> bool:
 def run_convert(job: ConvertJob, log_path: Path | None = None) -> int:
     validate_job(job)
     probe_json = probe(job.input)
+    unsupported_reason = unsupported_ffmpeg_video_reason(probe_json, job.input)
+    if unsupported_reason:
+        raise RuntimeError(unsupported_reason)
     duration = duration_seconds(probe_json)
 
     args = build_ffmpeg_args(job)
