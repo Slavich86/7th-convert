@@ -44,9 +44,30 @@ python3 -m pip install -r requirements.txt
 
 ## Run
 
+Recommended launch from the repository root:
+
+```bash
+./7th-vfx-convertor.sh
+```
+
+The launcher checks required system tools and Python modules before starting the UI.
+
+Direct Python launch is also available:
+
 ```bash
 python3 -m seventh_convert.ui
 ```
+
+## Desktop Launcher
+
+The repository includes:
+
+```text
+7th-vfx-convertor.desktop
+7th-vfx-convertor.sh
+```
+
+The `.desktop` file expects `7th-vfx-convertor.sh` to be in the same directory. If your file manager blocks launching desktop files, mark both files as executable or run the shell launcher directly.
 
 ## Features
 

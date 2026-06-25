@@ -42,9 +42,30 @@ python3 -m pip install -r requirements.txt
 
 ## Запуск
 
+Рекомендований запуск з кореня репозиторію:
+
+```bash
+./7th-vfx-convertor.sh
+```
+
+Launcher перевіряє потрібні системні інструменти та Python-модулі перед запуском UI.
+
+Прямий запуск через Python теж доступний:
+
 ```bash
 python3 -m seventh_convert.ui
 ```
+
+## Desktop Launcher
+
+У репозиторії є:
+
+```text
+7th-vfx-convertor.desktop
+7th-vfx-convertor.sh
+```
+
+`.desktop` файл очікує, що `7th-vfx-convertor.sh` лежить у тій самій теці. Якщо файловий менеджер блокує запуск desktop-файлів, зроби обидва файли executable або запускай shell launcher напряму.
 
 ## Що вміє програма
 
