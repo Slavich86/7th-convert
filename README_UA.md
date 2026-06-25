@@ -1,4 +1,28 @@
-# 7th VFX convertor
+<p align="center">
+  <img src="docs/images/social-preview.jpg" alt="7th VFX convertor" width="900">
+</p>
+
+<p align="center">
+  <strong>Десктопний VFX media converter для Linux.</strong>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.11%2B-blue" alt="Python 3.11+">
+  <img src="https://img.shields.io/badge/UI-Qt%206-green" alt="Qt 6">
+  <img src="https://img.shields.io/badge/Platform-Linux-lightgrey" alt="Linux">
+  <img src="https://img.shields.io/github/v/release/Slavich86/7th-convert?include_prereleases" alt="Release">
+</p>
+
+<p align="center">
+  <a href="#встановлення-системних-залежностей">Встановлення</a> &bull;
+  <a href="#запуск">Запуск</a> &bull;
+  <a href="#підтримувані-input-файли">Input формати</a> &bull;
+  <a href="#підтримувані-output-формати">Output формати</a> &bull;
+  <a href="#хоткеї">Хоткеї</a> &bull;
+  <a href="README.md">English</a>
+</p>
+
+---
 
 **7th VFX convertor** - десктопний конвертор медіа для VFX-пайплайнів.
 
@@ -30,11 +54,26 @@ Alpine Linux | `sudo apk add ffmpeg`
 
 Потрібен Python 3.11+.
 
+Рекомендовано: встановити `uv`, після цього launcher сам створить `.venv` і поставить Python-залежності туди:
+
 ```bash
-python3 -m pip install PySide6 PyOpenColorIO OpenEXR
+curl -LsSf https://astral.sh/uv/install.sh | sh
+./7th-vfx-convertor.sh
 ```
 
-Або встановити залежності зі списку проєкту:
+Launcher створює:
+
+```text
+.venv/
+```
+
+і встановлює залежності командою:
+
+```bash
+uv pip install --python .venv/bin/python --link-mode=copy -r requirements.txt
+```
+
+Fallback без `uv`:
 
 ```bash
 python3 -m pip install -r requirements.txt
@@ -49,11 +88,12 @@ python3 -m pip install -r requirements.txt
 ```
 
 Launcher перевіряє потрібні системні інструменти та Python-модулі перед запуском UI.
+Якщо доступний `uv`, launcher автоматично готує локальну `.venv` і запускає UI через `.venv/bin/python`.
 
 Прямий запуск через Python теж доступний:
 
 ```bash
-python3 -m seventh_convert.ui
+.venv/bin/python -m seventh_convert.ui
 ```
 
 ## Desktop Launcher

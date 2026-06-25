@@ -1,12 +1,34 @@
-# 7th VFX convertor
+<p align="center">
+  <img src="docs/images/social-preview.jpg" alt="7th VFX convertor" width="900">
+</p>
+
+<p align="center">
+  <strong>Desktop VFX media converter for Linux.</strong>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.11%2B-blue" alt="Python 3.11+">
+  <img src="https://img.shields.io/badge/UI-Qt%206-green" alt="Qt 6">
+  <img src="https://img.shields.io/badge/Platform-Linux-lightgrey" alt="Linux">
+  <img src="https://img.shields.io/github/v/release/Slavich86/7th-convert?include_prereleases" alt="Release">
+</p>
+
+<p align="center">
+  <a href="#install-system-dependencies">Install</a> &bull;
+  <a href="#run">Run</a> &bull;
+  <a href="#supported-input-files">Input Formats</a> &bull;
+  <a href="#supported-output-formats">Output Formats</a> &bull;
+  <a href="#hotkeys">Hotkeys</a> &bull;
+  <a href="README_UA.md">Українська</a>
+</p>
+
+---
 
 **7th VFX convertor** is a desktop media converter for VFX workflows.
 
 The application is built for converting video, image sequences, still images, and audio with control over color transforms, output size, pixel aspect, In/Out ranges, and presets.
 
 The current version is written in Python with a Qt 6 Widgets UI and uses `ffmpeg` / `ffprobe` for media analysis and conversion.
-
-Ukrainian README: [README_UA.md](README_UA.md)
 
 ![7th VFX convertor main window](docs/images/main-window.png)
 
@@ -32,11 +54,26 @@ Alpine Linux | `sudo apk add ffmpeg`
 
 Python 3.11+ is required.
 
+Recommended: install `uv`, then let the launcher create `.venv` and install Python dependencies there:
+
 ```bash
-python3 -m pip install PySide6 PyOpenColorIO OpenEXR
+curl -LsSf https://astral.sh/uv/install.sh | sh
+./7th-vfx-convertor.sh
 ```
 
-Or install the pinned project dependency list:
+The launcher creates:
+
+```text
+.venv/
+```
+
+and installs:
+
+```bash
+uv pip install --python .venv/bin/python --link-mode=copy -r requirements.txt
+```
+
+Fallback without `uv`:
 
 ```bash
 python3 -m pip install -r requirements.txt
@@ -51,11 +88,12 @@ Recommended launch from the repository root:
 ```
 
 The launcher checks required system tools and Python modules before starting the UI.
+When `uv` is available, it prepares the local `.venv` automatically and runs the UI through `.venv/bin/python`.
 
 Direct Python launch is also available:
 
 ```bash
-python3 -m seventh_convert.ui
+.venv/bin/python -m seventh_convert.ui
 ```
 
 ## Desktop Launcher
