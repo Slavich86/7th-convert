@@ -123,6 +123,17 @@ MOV
 MP4
 ```
 
+Заплановані video output контейнери:
+
+```text
+MKV
+WEBM
+MXF
+AVI
+```
+
+Для цих контейнерів ще треба окремо налаштувати codec, audio, metadata та validation rules перед тим, як вмикати їх у UI.
+
 Audio:
 
 ```text

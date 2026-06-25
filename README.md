@@ -125,6 +125,17 @@ MOV
 MP4
 ```
 
+Planned video output containers:
+
+```text
+MKV
+WEBM
+MXF
+AVI
+```
+
+These planned containers still need separate codec, audio, metadata, and validation rules before they are enabled in the UI.
+
 Audio:
 
 ```text
