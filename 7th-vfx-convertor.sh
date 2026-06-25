@@ -63,7 +63,7 @@ ensure_uv_venv() {
   fi
 
   if [ "$expected_hash" != "$current_hash" ]; then
-    printf 'Installing Python dependencies into %s with uv\n' "$VENV_DIR"
+    printf 'Installing Python dependencies into %s with uv pip-compatible installer\n' "$VENV_DIR"
     uv pip install --python "$VENV_PYTHON" --link-mode=copy -r "$REQUIREMENTS_FILE" || return 1
     printf '%s\n' "$expected_hash" > "$REQUIREMENTS_MARKER"
   fi
