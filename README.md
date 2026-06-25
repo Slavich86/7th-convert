@@ -89,116 +89,91 @@ The `.desktop` file expects `7th-vfx-convertor.sh` to be in the same directory. 
 
 Video:
 
-```text
-mov, mp4, mkv, ts, mxf, m4v, avi, webm
-```
+`mov, mp4, mkv, ts, mxf, m4v, avi, webm`
 
 Images and image sequences:
 
-```text
-exr, dpx, png, jpg, jpeg, tga, targa, tif, tiff, gif
-```
+`exr, dpx, png, jpg, jpeg, tga, targa, tif, tiff, gif`
 
 Audio:
 
-```text
-wav, mp3, aac, m4a, flac, ogg
-```
+`wav, mp3, aac, m4a, flac, ogg`
 
 ## Supported Output Formats
 
 Image sequences / images:
 
-```text
-EXR
-DPX
-PNG
-JPG
-TARGA
-GIF
-```
+`EXR, DPX, PNG, JPG, TARGA, GIF`
 
 Video:
 
-```text
-MOV
-MP4
-```
+`MOV, MP4`
 
 Planned video output containers:
 
-```text
-MKV
-WEBM
-MXF
-AVI
-```
+`MKV, WEBM, MXF, AVI`
 
 These planned containers still need separate codec, audio, metadata, and validation rules before they are enabled in the UI.
 
 Audio:
 
-```text
-WAV
-MP3
-AAC
-```
+`WAV, MP3, AAC`
 
 ## Codecs and Settings
 
 MP4:
 
-```text
-H.264
-H.265
-H.264 NVENC
-H.265 NVENC
-```
+`H.264, H.265, H.264 NVENC, H.265 NVENC`
 
 MOV:
 
-```text
-ProRes
-```
+`ProRes`
 
 EXR:
 
-```text
-16-bit half float by default
-Compression: none, zip1, zip16, rle
-```
+`16-bit half float by default, compression: none, zip1, zip16, rle`
 
 PNG:
 
-```text
-RGB 8-bit
-RGBA 8-bit
-RGB 16-bit
-RGBA 16-bit
-```
+`RGB 8-bit, RGBA 8-bit, RGB 16-bit, RGBA 16-bit`
 
 JPG:
 
-```text
-Quality slider 0-100
-```
+`Quality slider 0-100`
 
 GIF:
 
-```text
-Optimized palette
-Sierra dithering
-Bayer dithering
-No dithering
-```
+`Optimized palette, Sierra dithering, Bayer dithering, No dithering`
 
 Audio:
 
-```text
-WAV 16-bit: 48 kHz, 44.1 kHz, 24 kHz, 14 kHz, 8 kHz
-MP3: up to 256 kb/s
-AAC: up to 256 kb/s
-```
+`WAV 16-bit: 48 kHz, 44.1 kHz, 24 kHz, 14 kHz, 8 kHz; MP3: up to 256 kb/s; AAC: up to 256 kb/s`
+
+## Image Geometry and Pixel Aspect
+
+The Image block controls scale, output size, pixel aspect, and pixel-aspect output behavior.
+
+- `Scale` changes output size proportionally.
+- `Output Size` can be edited directly; width and height keep the source aspect ratio.
+- `Pixel Aspect: Auto` reads source pixel aspect when available, including EXR `pixelAspectRatio`.
+- `Pixel Aspect: Manual` lets you enter PAR manually when metadata is missing or wrong.
+- `Manual PAR` is disabled in Auto mode but still shows the detected value.
+- `Pixel Aspect Output: Keep Original Pixels` keeps the raster size and preserves non-square pixel intent.
+- `Pixel Aspect Output: Resize to Square Pixels` stretches the image to square pixels, useful for anamorphic sources.
+
+Example: a `2880 x 2160` EXR sequence with PAR `2.0` previews as `5760 x 2160` display aspect.
+
+## Audio Workflow
+
+The converter can work with source audio, external audio, or audio-only outputs.
+
+- `Audio Input` lets you add an external audio file.
+- Dragging one audio file into the app fills `Audio Input`.
+- Supported audio input: `wav, mp3, aac, m4a, flac, ogg`.
+- Supported audio output: `WAV, MP3, AAC`.
+- Video files with embedded audio can use `Copy Source Audio`, `AAC`, `MP3`, or `WAV`.
+- For MP4 with external audio, `Add Audio Without Re-encoding Video` copies the video stream and only encodes/muxes the audio.
+- In that mode, resize, pixel aspect, FPS, and color-transform controls are disabled because the video is not re-encoded.
 
 ## Color Management
 

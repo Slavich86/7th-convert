@@ -87,116 +87,91 @@ python3 -m seventh_convert.ui
 
 Відео:
 
-```text
-mov, mp4, mkv, ts, mxf, m4v, avi, webm
-```
+`mov, mp4, mkv, ts, mxf, m4v, avi, webm`
 
 Зображення та image sequence:
 
-```text
-exr, dpx, png, jpg, jpeg, tga, targa, tif, tiff, gif
-```
+`exr, dpx, png, jpg, jpeg, tga, targa, tif, tiff, gif`
 
 Аудіо:
 
-```text
-wav, mp3, aac, m4a, flac, ogg
-```
+`wav, mp3, aac, m4a, flac, ogg`
 
 ## Підтримувані output формати
 
 Image sequence / images:
 
-```text
-EXR
-DPX
-PNG
-JPG
-TARGA
-GIF
-```
+`EXR, DPX, PNG, JPG, TARGA, GIF`
 
 Video:
 
-```text
-MOV
-MP4
-```
+`MOV, MP4`
 
 Заплановані video output контейнери:
 
-```text
-MKV
-WEBM
-MXF
-AVI
-```
+`MKV, WEBM, MXF, AVI`
 
 Для цих контейнерів ще треба окремо налаштувати codec, audio, metadata та validation rules перед тим, як вмикати їх у UI.
 
 Audio:
 
-```text
-WAV
-MP3
-AAC
-```
+`WAV, MP3, AAC`
 
 ## Кодеки та налаштування
 
 MP4:
 
-```text
-H.264
-H.265
-H.264 NVENC
-H.265 NVENC
-```
+`H.264, H.265, H.264 NVENC, H.265 NVENC`
 
 MOV:
 
-```text
-ProRes
-```
+`ProRes`
 
 EXR:
 
-```text
-16-bit half float за замовчуванням
-Compression: none, zip1, zip16, rle
-```
+`16-bit half float за замовчуванням, compression: none, zip1, zip16, rle`
 
 PNG:
 
-```text
-RGB 8-bit
-RGBA 8-bit
-RGB 16-bit
-RGBA 16-bit
-```
+`RGB 8-bit, RGBA 8-bit, RGB 16-bit, RGBA 16-bit`
 
 JPG:
 
-```text
-Quality slider 0-100
-```
+`Quality slider 0-100`
 
 GIF:
 
-```text
-Optimized palette
-Sierra dithering
-Bayer dithering
-No dithering
-```
+`Optimized palette, Sierra dithering, Bayer dithering, No dithering`
 
 Audio:
 
-```text
-WAV 16-bit: 48 kHz, 44.1 kHz, 24 kHz, 14 kHz, 8 kHz
-MP3: до 256 kb/s
-AAC: до 256 kb/s
-```
+`WAV 16-bit: 48 kHz, 44.1 kHz, 24 kHz, 14 kHz, 8 kHz; MP3: до 256 kb/s; AAC: до 256 kb/s`
+
+## Image Geometry та Pixel Aspect
+
+Блок Image керує scale, output size, pixel aspect та тим, як записувати non-square pixels.
+
+- `Scale` пропорційно змінює output size.
+- `Output Size` можна редагувати напряму; width і height зберігають співвідношення сторін source.
+- `Pixel Aspect: Auto` читає pixel aspect з metadata, якщо він є, включно з EXR `pixelAspectRatio`.
+- `Pixel Aspect: Manual` дозволяє ввести PAR вручну, якщо metadata немає або вона неправильна.
+- `Manual PAR` у режимі Auto disabled, але показує знайдене значення.
+- `Pixel Aspect Output: Keep Original Pixels` зберігає raster size і non-square pixel intent.
+- `Pixel Aspect Output: Resize to Square Pixels` розтягує зображення до square pixels, що потрібно для анаморфних source.
+
+Приклад: EXR sequence `2880 x 2160` з PAR `2.0` у preview виглядає як `5760 x 2160` display aspect.
+
+## Робота зі звуком
+
+Конвертор може працювати із source audio, external audio або audio-only output.
+
+- `Audio Input` дозволяє додати окремий audio file.
+- Drag and Drop одного audio file заповнює `Audio Input`.
+- Підтримуваний audio input: `wav, mp3, aac, m4a, flac, ogg`.
+- Підтримуваний audio output: `WAV, MP3, AAC`.
+- Video files з embedded audio можуть використовувати `Copy Source Audio`, `AAC`, `MP3` або `WAV`.
+- Для MP4 з external audio режим `Add Audio Without Re-encoding Video` копіює video stream і тільки кодує/додає audio.
+- У цьому режимі resize, pixel aspect, FPS і color-transform controls disabled, бо video не перекодовується.
 
 ## Color Management
 
