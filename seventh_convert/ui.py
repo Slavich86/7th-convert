@@ -130,6 +130,8 @@ COLOR_TRANSFORM_OPTIONS = [
     ("Rec.709", "rec709"),
 ]
 
+COLOR_WORKFLOW_NONE = "none"
+# Legacy value kept only so existing settings and user presets remain readable.
 COLOR_WORKFLOW_BASIC = "basic"
 COLOR_WORKFLOW_BUILTIN_OCIO = "builtin_ocio"
 COLOR_WORKFLOW_OCIO = "ocio"
@@ -146,6 +148,14 @@ QUEUE_COL_PRESET = 3
 QUEUE_COL_STATUS = 4
 QUEUE_COL_PROGRESS = 5
 QUEUE_COL_ACTIONS = 6
+
+
+def _normalize_color_workflow(workflow: str) -> str:
+    if workflow == COLOR_WORKFLOW_BASIC:
+        return COLOR_WORKFLOW_NONE
+    if workflow in {COLOR_WORKFLOW_NONE, COLOR_WORKFLOW_BUILTIN_OCIO, COLOR_WORKFLOW_OCIO}:
+        return workflow
+    return COLOR_WORKFLOW_NONE
 
 
 @dataclass(frozen=True)
@@ -1134,12 +1144,13 @@ class PreferencesDialog(QDialog):
         form = QFormLayout(color_group)
 
         self.workflow_combo = QComboBox()
+        self.workflow_combo.addItem("None", COLOR_WORKFLOW_NONE)
         self.workflow_combo.addItem("Nuke", COLOR_WORKFLOW_BUILTIN_OCIO)
         self.workflow_combo.addItem("OCIO", COLOR_WORKFLOW_OCIO)
         self._custom_ocio_config_path = ocio_config_path
         self._set_combo_data(
             self.workflow_combo,
-            workflow if workflow in {COLOR_WORKFLOW_BUILTIN_OCIO, COLOR_WORKFLOW_OCIO} else COLOR_WORKFLOW_BUILTIN_OCIO,
+            _normalize_color_workflow(workflow),
         )
         form.addRow("Color Management", self.workflow_combo)
 
@@ -1198,6 +1209,13 @@ class PreferencesDialog(QDialog):
         workflow = self.selected_workflow()
         self.ocio_config_edit.setEnabled(workflow == COLOR_WORKFLOW_OCIO)
         self.ocio_browse_button.setEnabled(workflow == COLOR_WORKFLOW_OCIO)
+        if workflow == COLOR_WORKFLOW_NONE:
+            if self.ocio_config_edit.text() == _builtin_ocio_config(self.selected_builtin_ocio_config()).label:
+                self.ocio_config_edit.blockSignals(True)
+                self.ocio_config_edit.setText(self._custom_ocio_config_path)
+                self.ocio_config_edit.blockSignals(False)
+            self.ocio_status_label.setText("Color management disabled")
+            return
         if workflow == COLOR_WORKFLOW_BUILTIN_OCIO:
             config = _builtin_ocio_config(self.selected_builtin_ocio_config())
             if self.ocio_config_edit.text() != config.label:
@@ -1237,7 +1255,7 @@ class MainWindow(QMainWindow):
         self.app_config_dir = app_config_dir or _app_config_dir()
         self.app_settings = _read_app_settings(self.app_config_dir)
         self.user_presets_dir = _user_presets_dir(self.app_config_dir)
-        self.color_workflow = str(self.settings.value("color/workflow", COLOR_WORKFLOW_BASIC))
+        self.color_workflow = _normalize_color_workflow(str(self.settings.value("color/workflow", COLOR_WORKFLOW_NONE)))
         self.ocio_config_path = str(self.settings.value("ocio/config_path", ""))
         self.builtin_ocio_config = str(self.settings.value("ocio/builtin_config", "nuke-default"))
         self.ocio_color_spaces: list[str] = []
@@ -1447,9 +1465,9 @@ class MainWindow(QMainWindow):
         _append_error_log(report, self.app_config_dir)
 
     def reload_ocio_config(self) -> None:
-        if self.color_workflow == COLOR_WORKFLOW_BASIC:
+        if self.color_workflow == COLOR_WORKFLOW_NONE:
             self.ocio_color_spaces = []
-            self.ocio_status = "Basic workflow uses built-in transforms"
+            self.ocio_status = "Color management disabled"
             return
         if self.color_workflow == COLOR_WORKFLOW_BUILTIN_OCIO:
             config = _builtin_ocio_config(self.builtin_ocio_config)
@@ -1459,9 +1477,9 @@ class MainWindow(QMainWindow):
         if self.color_workflow == COLOR_WORKFLOW_OCIO:
             self.ocio_color_spaces, self.ocio_status = _load_ocio_color_spaces(self.ocio_config_path)
             return
-        self.color_workflow = COLOR_WORKFLOW_BASIC
+        self.color_workflow = COLOR_WORKFLOW_NONE
         self.ocio_color_spaces = []
-        self.ocio_status = "Basic workflow uses built-in transforms"
+        self.ocio_status = "Color management disabled"
 
     def ocio_workflow_is_active(self) -> bool:
         return self.color_workflow in {COLOR_WORKFLOW_BUILTIN_OCIO, COLOR_WORKFLOW_OCIO} and bool(self.ocio_color_spaces)
@@ -1495,8 +1513,7 @@ class MainWindow(QMainWindow):
         ocio_config_path: str,
         builtin_ocio_config: str | None = None,
     ) -> None:
-        valid_workflows = {COLOR_WORKFLOW_BASIC, COLOR_WORKFLOW_BUILTIN_OCIO, COLOR_WORKFLOW_OCIO}
-        self.color_workflow = workflow if workflow in valid_workflows else COLOR_WORKFLOW_BASIC
+        self.color_workflow = _normalize_color_workflow(workflow)
         self.ocio_config_path = ocio_config_path
         if builtin_ocio_config:
             self.builtin_ocio_config = builtin_ocio_config
@@ -1506,6 +1523,7 @@ class MainWindow(QMainWindow):
         self.reload_ocio_config()
         self.refresh_color_transform_options()
         self.refresh_color_transform_defaults()
+        self.refresh_color_transform_visibility()
         self.refresh_preview_display_transform()
 
     def save_user_preset(self) -> None:
@@ -1915,13 +1933,16 @@ class MainWindow(QMainWindow):
         quality_row.addWidget(self.jpg_quality_value_label)
         layout.addRow(self.jpg_quality_label, quality_row)
 
+        self.input_transform_label = QLabel("Input Transform")
+        self.output_transform_label = QLabel("Output Transform")
         self.input_transform_combo = QComboBox()
         self.output_transform_combo = QComboBox()
         self.input_transform_combo.currentIndexChanged.connect(lambda _index: self.refresh_preview_display_transform())
         self.output_transform_combo.currentIndexChanged.connect(lambda _index: self.handle_output_transform_changed())
-        layout.addRow("Input Transform", self.input_transform_combo)
-        layout.addRow("Output Transform", self.output_transform_combo)
+        layout.addRow(self.input_transform_label, self.input_transform_combo)
+        layout.addRow(self.output_transform_label, self.output_transform_combo)
         self.refresh_color_transform_options()
+        self.refresh_color_transform_visibility()
 
         self.output_edit = QLineEdit()
         self.output_edit.textEdited.connect(lambda _text: self.mark_output_path_manual())
@@ -2535,10 +2556,14 @@ class MainWindow(QMainWindow):
         return audio
 
     def selected_input_transform(self) -> str:
-        return str(self.input_transform_combo.currentData())
+        if self.color_workflow == COLOR_WORKFLOW_NONE:
+            return "none"
+        return str(self.input_transform_combo.currentData() or "none")
 
     def selected_output_transform(self) -> str:
-        return str(self.output_transform_combo.currentData())
+        if self.color_workflow == COLOR_WORKFLOW_NONE:
+            return "none"
+        return str(self.output_transform_combo.currentData() or "none")
 
     def selected_output_transform_label(self) -> str:
         return self.output_transform_combo.currentText() or self.selected_output_transform()
@@ -2559,7 +2584,9 @@ class MainWindow(QMainWindow):
         self.input_transform_combo.clear()
         self.output_transform_combo.clear()
 
-        if self.ocio_workflow_is_active():
+        if self.color_workflow == COLOR_WORKFLOW_NONE:
+            pass
+        elif self.ocio_workflow_is_active():
             for color_space in self.ocio_color_spaces:
                 value = f"ocio:{color_space}"
                 self.input_transform_combo.addItem(color_space, value)
@@ -2577,7 +2604,19 @@ class MainWindow(QMainWindow):
         self.input_transform_combo.blockSignals(False)
         self.output_transform_combo.blockSignals(False)
 
+    def refresh_color_transform_visibility(self) -> None:
+        visible = self.color_workflow != COLOR_WORKFLOW_NONE
+        for widget in (
+            self.input_transform_label,
+            self.input_transform_combo,
+            self.output_transform_label,
+            self.output_transform_combo,
+        ):
+            widget.setVisible(visible)
+
     def refresh_color_transform_defaults(self) -> None:
+        if self.color_workflow == COLOR_WORKFLOW_NONE:
+            return
         if self.ocio_workflow_is_active():
             input_path = Path(self.input_edit.text()).expanduser() if self.input_edit.text().strip() else None
             input_default = self._default_ocio_input_color_space(input_path)
@@ -2684,6 +2723,9 @@ class MainWindow(QMainWindow):
 
         selected_input_transform = self.selected_input_transform()
         selected_output_transform = self.selected_output_transform()
+        if self.color_workflow == COLOR_WORKFLOW_NONE:
+            for key in ("color_primaries", "color_trc", "colorspace", "color_range"):
+                video.pop(key, None)
         video.update(_video_color_metadata_for_output_transform(selected_output_transform, file_type))
         filters["input_color_space"] = _command_color_space_value(selected_input_transform)
         filters["output_color_space"] = _command_color_space_value(selected_output_transform)

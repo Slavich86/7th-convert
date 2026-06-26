@@ -226,13 +226,16 @@ Linear
 Rec.709
 ```
 
-OCIO color management:
+Color-management modes:
 
 ```text
+None
 Nuke Default OCIO
 Custom OCIO config
 ACES through a custom OCIO config
 ```
+
+In `None` mode, color management is disabled. Input and Output Transform controls are hidden, and the converter does not apply an OCIO LUT, an FFmpeg color transform, or forced output color metadata.
 
 In Nuke mode, the application uses the bundled Nuke-style OCIO config.
 
