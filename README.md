@@ -56,9 +56,18 @@ Python 3.11+ is required.
 
 Recommended: install `uv`, then let the launcher create `.venv` and install Python dependencies there:
 
+Linux:
+
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ./7th-vfx-convertor.sh
+```
+
+Windows PowerShell:
+
+```powershell
+winget install astral-sh.uv
+.\7th-vfx-convertor.bat
 ```
 
 The launcher creates:
@@ -75,25 +84,49 @@ uv pip install --python .venv/bin/python --link-mode=copy -r requirements.txt
 
 Fallback without `uv`:
 
+Linux:
+
 ```bash
 python3 -m pip install -r requirements.txt
+```
+
+Windows:
+
+```powershell
+python -m pip install -r requirements.txt
 ```
 
 ## Run
 
 Recommended launch from the repository root:
 
+Linux:
+
 ```bash
 ./7th-vfx-convertor.sh
 ```
 
+Windows:
+
+```powershell
+.\7th-vfx-convertor.bat
+```
+
 The launcher checks required system tools and Python modules before starting the UI.
-When `uv` is available, it prepares the local `.venv` automatically and runs the UI through `.venv/bin/python`.
+When `uv` is available, it prepares the local `.venv` automatically and runs the UI through the `.venv` Python interpreter.
 
 Direct Python launch is also available:
 
+Linux:
+
 ```bash
 .venv/bin/python -m seventh_convert.ui
+```
+
+Windows:
+
+```powershell
+.venv\Scripts\python.exe -m seventh_convert.ui
 ```
 
 ## Desktop Launcher
@@ -101,11 +134,12 @@ Direct Python launch is also available:
 The repository includes:
 
 ```text
+7th-vfx-convertor.bat
 7th-vfx-convertor.desktop
 7th-vfx-convertor.sh
 ```
 
-The `.desktop` file expects `7th-vfx-convertor.sh` to be in the same directory. If your file manager blocks launching desktop files, mark both files as executable or run the shell launcher directly.
+The `.desktop` file is for Linux and expects `7th-vfx-convertor.sh` to be in the same directory. If your file manager blocks launching desktop files, mark both files as executable or run the shell launcher directly. On Windows, use `7th-vfx-convertor.bat`.
 
 ## Features
 

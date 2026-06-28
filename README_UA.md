@@ -56,9 +56,18 @@ Alpine Linux | `sudo apk add ffmpeg`
 
 Рекомендовано: встановити `uv`, після цього launcher сам створить `.venv` і поставить Python-залежності туди:
 
+Linux:
+
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ./7th-vfx-convertor.sh
+```
+
+Windows PowerShell:
+
+```powershell
+winget install astral-sh.uv
+.\7th-vfx-convertor.bat
 ```
 
 Launcher створює:
@@ -75,25 +84,49 @@ uv pip install --python .venv/bin/python --link-mode=copy -r requirements.txt
 
 Fallback без `uv`:
 
+Linux:
+
 ```bash
 python3 -m pip install -r requirements.txt
+```
+
+Windows:
+
+```powershell
+python -m pip install -r requirements.txt
 ```
 
 ## Запуск
 
 Рекомендований запуск з кореня репозиторію:
 
+Linux:
+
 ```bash
 ./7th-vfx-convertor.sh
 ```
 
+Windows:
+
+```powershell
+.\7th-vfx-convertor.bat
+```
+
 Launcher перевіряє потрібні системні інструменти та Python-модулі перед запуском UI.
-Якщо доступний `uv`, launcher автоматично готує локальну `.venv` і запускає UI через `.venv/bin/python`.
+Якщо доступний `uv`, launcher автоматично готує локальну `.venv` і запускає UI через Python-інтерпретатор із `.venv`.
 
 Прямий запуск через Python теж доступний:
 
+Linux:
+
 ```bash
 .venv/bin/python -m seventh_convert.ui
+```
+
+Windows:
+
+```powershell
+.venv\Scripts\python.exe -m seventh_convert.ui
 ```
 
 ## Desktop Launcher
@@ -101,11 +134,12 @@ Launcher перевіряє потрібні системні інструмен
 У репозиторії є:
 
 ```text
+7th-vfx-convertor.bat
 7th-vfx-convertor.desktop
 7th-vfx-convertor.sh
 ```
 
-`.desktop` файл очікує, що `7th-vfx-convertor.sh` лежить у тій самій теці. Якщо файловий менеджер блокує запуск desktop-файлів, зроби обидва файли executable або запускай shell launcher напряму.
+`.desktop` файл потрібен для Linux і очікує, що `7th-vfx-convertor.sh` лежить у тій самій теці. Якщо файловий менеджер блокує запуск desktop-файлів, зроби обидва файли executable або запускай shell launcher напряму. На Windows використовуй `7th-vfx-convertor.bat`.
 
 ## Що вміє програма
 
