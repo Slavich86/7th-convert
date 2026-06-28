@@ -623,27 +623,48 @@ class TimelineSlider(QSlider):
 
         painter = QPainter(self)
         try:
+            self._draw_selected_range(painter)
             self._draw_marker(painter, self.in_marker_ms, QColor("#66d17a"))
             self._draw_marker(painter, self.out_marker_ms, QColor("#ff6b6b"))
         finally:
             painter.end()
 
+    def _draw_selected_range(self, painter: QPainter) -> None:
+        if self.in_marker_ms is None or self.out_marker_ms is None:
+            return
+        start_x = self._marker_x(self.in_marker_ms)
+        end_x = self._marker_x(self.out_marker_ms)
+        if start_x is None or end_x is None or start_x == end_x:
+            return
+        left = min(start_x, end_x)
+        width = abs(end_x - start_x)
+        color = QColor("#ff9d00")
+        color.setAlpha(95)
+        painter.fillRect(left, 5, width, max(self.height() - 10, 1), color)
+
     def _draw_marker(self, painter: QPainter, value_ms: int | None, color: QColor) -> None:
         if value_ms is None:
             return
 
-        minimum = self.minimum()
-        maximum = self.maximum()
-        slider_value = self.marker_to_slider_value(value_ms) if self.marker_to_slider_value else value_ms
-        value = max(minimum, min(maximum, slider_value))
-        ratio = (value - minimum) / (maximum - minimum)
-        margin = 8
-        x = round(margin + ratio * max(self.width() - margin * 2, 1))
+        x = self._marker_x(value_ms)
+        if x is None:
+            return
 
         painter.setPen(color)
         painter.setBrush(color)
         painter.drawLine(x, 3, x, self.height() - 3)
         painter.drawPolygon([QPoint(x - 5, 1), QPoint(x + 5, 1), QPoint(x, 7)])
+
+    def _marker_x(self, value_ms: int) -> int | None:
+        minimum = self.minimum()
+        maximum = self.maximum()
+        if maximum <= minimum:
+            return None
+        slider_value = self.marker_to_slider_value(value_ms) if self.marker_to_slider_value else value_ms
+        value = max(minimum, min(maximum, slider_value))
+        ratio = (value - minimum) / (maximum - minimum)
+        margin = 8
+        return round(margin + ratio * max(self.width() - margin * 2, 1))
 
 
 class PreviewLabel(QLabel):
@@ -2380,6 +2401,7 @@ class MainWindow(QMainWindow):
         formats: list[tuple[str, str]] = []
         if mode == "source":
             formats.append(("Copy Source Audio", "copy"))
+            formats.append(("No Audio", "none"))
         if mode in {"external", "source"}:
             formats.extend((OUTPUT_OPTIONS[file_type]["label"], file_type) for file_type in ("aac", "mp3", "wav"))
 
@@ -2403,7 +2425,7 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "audio_profile_combo"):
             return
         file_type = self.selected_external_audio_format()
-        if file_type == "copy":
+        if file_type in {"copy", "none"}:
             self.audio_profile_label.setVisible(False)
             self.audio_profile_combo.setVisible(False)
             self.audio_profile_combo.clear()
@@ -2535,6 +2557,8 @@ class MainWindow(QMainWindow):
 
     def selected_embedded_audio_settings(self) -> dict:
         file_type = self.selected_external_audio_format()
+        if file_type == "none":
+            return {"enabled": False}
         if file_type == "copy":
             return {"enabled": True, "codec": "copy"}
         return self.selected_audio_settings(file_type, self.selected_external_audio_profile(), shortest=False)
@@ -3762,6 +3786,7 @@ class MainWindow(QMainWindow):
 
 
 def main() -> int:
+    QApplication.setDesktopFileName("7th-vfx-convertor")
     app = QApplication(sys.argv)
     apply_theme(app)
     window = MainWindow()
