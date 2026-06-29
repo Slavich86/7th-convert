@@ -59,11 +59,12 @@ Recommended: install `uv`, then let the launcher create `.venv` and install Pyth
 Linux:
 
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
+git clone https://github.com/Slavich86/7th-convert.git
+cd 7th-convert
 ./7th-vfx-convertor.sh
 ```
 
-Windows (recommended: `git clone` enables self-update):
+Windows:
 
 ```powershell
 git clone https://github.com/Slavich86/7th-convert.git
@@ -71,14 +72,11 @@ cd 7th-convert
 .\7th-vfx-convertor.bat
 ```
 
-You can also install `uv` manually and run the launcher:
+The launcher checks for `python`, `ffmpeg`, `ffprobe`, and `uv`. If `ffmpeg` or `uv` are missing on Windows, it offers to install them automatically through `winget`. On Linux, install `ffmpeg` through your package manager.
 
-```powershell
-winget install astral-sh.uv
-.\7th-vfx-convertor.bat
-```
-
-The `.bat` launcher checks for `python`, `ffmpeg`, `ffprobe`, and `uv`. If `ffmpeg` or `uv` are missing, it offers to install them automatically through `winget`.
+> **Self-update** (`Help → Check for Updates`) works only when the converter
+> is installed via `git clone`. ZIP downloads do not include the `.git` folder
+> required for automatic updates.
 
 The launcher creates:
 

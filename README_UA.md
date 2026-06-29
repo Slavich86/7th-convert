@@ -59,11 +59,12 @@ Alpine Linux | `sudo apk add ffmpeg`
 Linux:
 
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
+git clone https://github.com/Slavich86/7th-convert.git
+cd 7th-convert
 ./7th-vfx-convertor.sh
 ```
 
-Windows (рекомендовано: `git clone` вмикає self-update):
+Windows:
 
 ```powershell
 git clone https://github.com/Slavich86/7th-convert.git
@@ -71,14 +72,11 @@ cd 7th-convert
 .\7th-vfx-convertor.bat
 ```
 
-Можна також встановити `uv` вручну і запустити launcher:
+Launcher перевіряє `python`, `ffmpeg`, `ffprobe` та `uv`. Якщо `ffmpeg` або `uv` відсутні на Windows — пропонує встановити їх автоматично через `winget`. На Linux встановіть `ffmpeg` через пакетний менеджер.
 
-```powershell
-winget install astral-sh.uv
-.\7th-vfx-convertor.bat
-```
-
-`.bat` launcher перевіряє `python`, `ffmpeg`, `ffprobe` та `uv`. Якщо `ffmpeg` або `uv` відсутні — пропонує встановити їх автоматично через `winget`.
+> **Self-update** (`Help → Check for Updates`) працює тільки коли конвертер
+> встановлено через `git clone`. ZIP-архіви не містять `.git` теку, необхідну
+> для автоматичних оновлень.
 
 Launcher створює:
 
