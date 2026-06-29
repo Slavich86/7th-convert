@@ -1,5 +1,5 @@
 @echo off
-setlocal
+setlocal EnableExtensions EnableDelayedExpansion
 
 set "APP_DIR=%~dp0"
 cd /d "%APP_DIR%" || exit /b 1
@@ -29,6 +29,24 @@ call :require_command ffprobe
 if "%MISSING%"=="0" (
     where uv >nul 2>nul
     if errorlevel 1 (
+        echo uv is not available 1>&2
+        set /p "INSTALL_UV=Install uv via winget automatically? (Y/N): "
+        if /i "!INSTALL_UV!"=="Y" (
+            echo.
+            echo Running: winget install astral-sh.uv
+            winget install --id astral-sh.uv --exact --silent --accept-package-agreements --accept-source-agreements
+            if errorlevel 1 (
+                echo uv install failed; falling back to system Python. 1>&2
+            ) else (
+                echo uv installed. Please restart this terminal, or run the command below:
+                echo   "!LOCALAPPDATA!\Microsoft\WinGet\Links\uv.exe" -m seventh_convert.ui
+                pause
+                exit /b 1
+            )
+        )
+    )
+    where uv >nul 2>nul
+    if errorlevel 1 (
         echo uv is not available; falling back to system Python. 1>&2
     ) else (
         if not exist "%VENV_PYTHON%" (
@@ -53,6 +71,7 @@ if "%MISSING%"=="0" (
 )
 
 if "%MISSING%"=="0" (
+    call :require_python_module numpy
     call :require_python_module PySide6
     call :require_python_module PyOpenColorIO
     call :require_python_module OpenEXR
@@ -81,6 +100,17 @@ exit /b %ERRORLEVEL%
 where %1 >nul 2>nul
 if errorlevel 1 (
     echo Missing required command: %1 1>&2
+    if /i "%1"=="ffmpeg" (
+        set /p "INSTALL_FFMPEG=Install FFmpeg automatically? (Y/N): "
+        if /i "!INSTALL_FFMPEG!"=="Y" (
+            echo.
+            call "%APP_DIR%install-ffmpeg.bat"
+            echo.
+            echo IMPORTANT: Open a NEW terminal and run 7th-vfx-convertor.bat again.
+            pause
+            exit /b 1
+        )
+    )
     set "MISSING=1"
 )
 exit /b 0

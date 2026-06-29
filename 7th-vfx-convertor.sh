@@ -84,6 +84,7 @@ if [ "$missing" -eq 0 ]; then
 fi
 
 if command -v "$APP_PYTHON" >/dev/null 2>&1 || [ -x "$APP_PYTHON" ]; then
+  require_python_module numpy
   require_python_module PySide6
   require_python_module PyOpenColorIO
   require_python_module OpenEXR

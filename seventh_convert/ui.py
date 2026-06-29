@@ -141,6 +141,7 @@ PIXEL_ASPECT_MANUAL = "manual"
 ANAMORPH_OUTPUT_PRESERVE = "preserve"
 ANAMORPH_OUTPUT_BAKE = "bake"
 FPS_OUTPUT_FILE_TYPES = {"mov", "mp4"}
+PREVIEW_PROXY_MAX_WIDTH = 1280
 QUEUE_COL_ACTIVE = 0
 QUEUE_COL_INPUT = 1
 QUEUE_COL_OUTPUT = 2
@@ -178,6 +179,13 @@ def _app_config_dir() -> Path:
     base = os.environ.get("XDG_CONFIG_HOME")
     root = Path(base).expanduser() if base else Path.home() / ".config"
     return root / APP_CONFIG_DIR_NAME
+
+
+def _app_repo_root() -> Path | None:
+    candidate = Path(__file__).resolve().parent.parent
+    if (candidate / ".git").is_dir():
+        return candidate
+    return None
 
 
 def _user_presets_dir(config_dir: Path | None = None) -> Path:
@@ -887,6 +895,130 @@ class UpdateCheckWorker(QThread):
         self.up_to_date.emit(tag)
 
 
+class SelfUpdateWorker(QThread):
+    def __init__(self, repo_root: Path) -> None:
+        super().__init__()
+        self.repo_root = repo_root
+        self.success = False
+        self.error_message: str | None = None
+
+    def run(self) -> None:
+        try:
+            status = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=str(self.repo_root),
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if status.stdout.strip():
+                self.error_message = "Local changes detected. Please commit or stash them first."
+                return
+
+            result = subprocess.run(
+                ["git", "fetch", "origin", "main"],
+                cwd=str(self.repo_root),
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if result.returncode != 0:
+                self.error_message = f"Git fetch failed:\n{result.stderr.strip()}"
+                return
+
+            result = subprocess.run(
+                ["git", "reset", "--hard", "origin/main"],
+                cwd=str(self.repo_root),
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if result.returncode != 0:
+                self.error_message = f"Git reset failed:\n{result.stderr.strip()}"
+                return
+
+            venv_python = self.repo_root / ".venv" / "bin" / "python"
+            if not venv_python.exists():
+                venv_python = self.repo_root / ".venv" / "Scripts" / "python.exe"
+            requirements = self.repo_root / "requirements.txt"
+            if venv_python.exists() and requirements.exists():
+                subprocess.run(
+                    [
+                        "uv", "pip", "install", "--python", str(venv_python),
+                        "--link-mode=copy", "-r", str(requirements),
+                    ],
+                    cwd=str(self.repo_root),
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    check=False,
+                )
+
+            self.success = True
+        except subprocess.TimeoutExpired:
+            self.error_message = "Update timed out."
+        except OSError as exc:
+            self.error_message = f"Git is not available: {exc}"
+        except Exception as exc:  # noqa: BLE001 - concise UI message.
+            self.error_message = str(exc)
+
+
+class PreviewProxyWorker(QThread):
+    ready = Signal(str, str)
+    failed = Signal(str, str, str)
+
+    def __init__(self, source_path: Path) -> None:
+        super().__init__()
+        self.source_path = source_path
+
+    def run(self) -> None:
+        try:
+            proxy_path = _preview_proxy_path(self.source_path)
+            if not proxy_path.exists():
+                proxy_path.parent.mkdir(parents=True, exist_ok=True)
+                args = [
+                    "ffmpeg",
+                    "-hide_banner",
+                    "-y",
+                    "-i",
+                    str(self.source_path),
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "0:a:0?",
+                    "-sn",
+                    "-dn",
+                    "-vf",
+                    f"scale='min({PREVIEW_PROXY_MAX_WIDTH},iw)':-2:force_original_aspect_ratio=decrease",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-crf",
+                    "18",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "160k",
+                    "-ac",
+                    "2",
+                    "-movflags",
+                    "+faststart",
+                    str(proxy_path),
+                ]
+                completed = subprocess.run(args, text=True, capture_output=True, check=False)
+                if completed.returncode != 0:
+                    raise RuntimeError(completed.stderr.strip() or "ffmpeg preview proxy failed")
+            self.ready.emit(str(self.source_path), str(proxy_path))
+        except Exception as exc:  # noqa: BLE001 - worker reports concise UI errors.
+            self.failed.emit(str(self.source_path), str(exc), traceback.format_exc())
+
+
 @dataclass(frozen=True)
 class SelectedInput:
     input_path: Path
@@ -1288,6 +1420,7 @@ class MainWindow(QMainWindow):
         self.last_error_report = ""
         self.current_worker: ConvertWorker | None = None
         self.update_check_worker: UpdateCheckWorker | None = None
+        self.self_update_worker: SelfUpdateWorker | None = None
         self.queue_jobs: list[QueueJobSnapshot] = []
         self.queue_run_all_active = False
         self.queue_pause_requested = False
@@ -1297,6 +1430,7 @@ class MainWindow(QMainWindow):
         self.current_fps = 25.0
         self.fps_value_is_manual = False
         self.current_source_raster_size: QSize | None = None
+        self.output_directory_override: Path | None = None
         self._updating_scale_controls = False
 
         self.player: QMediaPlayer | None = None
@@ -1306,6 +1440,9 @@ class MainWindow(QMainWindow):
         self._last_video_source_pixmap = QPixmap()
         self.preview_source_path: Path | None = None
         self.preview_is_sequence = False
+        self.preview_proxy_path: Path | None = None
+        self.preview_proxy_requested_for: Path | None = None
+        self.preview_proxy_worker: PreviewProxyWorker | None = None
         self.current_input_is_sequence = False
         self.current_input_sequence_start: int | None = None
         self.current_input_sequence_end: int | None = None
@@ -1441,11 +1578,47 @@ class MainWindow(QMainWindow):
 
     def handle_update_found(self, latest_tag: str, url: str) -> None:
         self.progress_label.setText("Update available")
-        QMessageBox.information(
+        repo_root = _app_repo_root()
+        if repo_root is None:
+            QMessageBox.information(
+                self,
+                "Update Available",
+                f"Current version: {__version__}\nLatest version: {latest_tag}\n\n{url}",
+            )
+            return
+
+        reply = QMessageBox.question(
             self,
             "Update Available",
-            f"Current version: {__version__}\nLatest version: {latest_tag}\n\n{url}",
+            f"Current version: {__version__}\nLatest version: {latest_tag}\n\n"
+            f"Update converter automatically in:\n{repo_root}?\n\n"
+            f"This will pull latest changes from GitHub.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
         )
+        if reply == QMessageBox.StandardButton.Yes:
+            self._start_self_update(repo_root, latest_tag)
+        else:
+            QDesktopServices.openUrl(QUrl(url))
+
+    def _start_self_update(self, repo_root: Path, latest_tag: str) -> None:
+        self.progress_label.setText("Updating converter...")
+        worker = SelfUpdateWorker(repo_root)
+        worker.finished.connect(lambda w=worker: self._handle_self_update_finished(w, repo_root, latest_tag))
+        self.self_update_worker = worker
+        worker.start()
+
+    def _handle_self_update_finished(self, worker: SelfUpdateWorker, repo_root: Path, latest_tag: str) -> None:
+        if not worker.success:
+            QMessageBox.warning(self, "Update Failed", worker.error_message or "Unknown error")
+            self.progress_label.setText("Update failed")
+            return
+        QMessageBox.information(
+            self,
+            "Update Complete",
+            f"Converter updated to {latest_tag}.\n\nPlease restart the application.",
+        )
+        self.progress_label.setText(f"Updated to {latest_tag}. Restart required.")
 
     def handle_up_to_date(self, latest_tag: str) -> None:
         self.progress_label.setText("Up to date")
@@ -1607,6 +1780,7 @@ class MainWindow(QMainWindow):
             "audio_input": self.audio_input_edit.text().strip(),
             "output": self.output_edit.text().strip(),
             "output_path_is_manual": self.output_path_is_manual,
+            "output_directory_override": str(self.output_directory_override) if self.output_directory_override else "",
             "file_type": self.selected_file_type(),
             "codec": self.selected_codec(),
             "profile": self.selected_profile(),
@@ -1688,6 +1862,8 @@ class MainWindow(QMainWindow):
         output_path = str(converter.get("output") or "")
         self.output_edit.setText(output_path)
         self.output_path_is_manual = bool(converter.get("output_path_is_manual", bool(output_path)))
+        output_directory_override = str(converter.get("output_directory_override") or "").strip()
+        self.output_directory_override = Path(output_directory_override).expanduser() if output_directory_override else None
 
         self._set_combo_data(self.input_transform_combo, str(converter.get("input_transform") or self.selected_input_transform()))
         self._set_combo_data(self.output_transform_combo, str(converter.get("output_transform") or self.selected_output_transform()))
@@ -1790,9 +1966,13 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(8, 4, 8, 4)
         self.progress_bar = QProgressBar()
         self.progress_label = QLabel("Idle")
+        self.stop_convert_button = QPushButton("Stop")
+        self.stop_convert_button.setEnabled(False)
+        self.stop_convert_button.clicked.connect(self.cancel_queue)
         layout.addWidget(QLabel("Progress"))
         layout.addWidget(self.progress_bar, stretch=1)
         layout.addWidget(self.progress_label)
+        layout.addWidget(self.stop_convert_button)
         return panel
 
     def _build_player_panel(self) -> QWidget:
@@ -2064,6 +2244,14 @@ class MainWindow(QMainWindow):
         self.apply_selected_input(selected)
 
     def apply_selected_input(self, selected: SelectedInput) -> None:
+        previous_input_text = self.input_edit.text().strip()
+        previous_input_path = Path(previous_input_text).expanduser() if previous_input_text else None
+        previous_output_text = self.output_edit.text().strip() if hasattr(self, "output_edit") else ""
+        previous_output_transform = self.selected_output_transform()
+        previous_sequence_start = self.current_input_sequence_start
+        previous_sequence_end = self.current_input_sequence_end
+        previous_sequence_start_text = self.current_input_sequence_start_text
+        previous_sequence_end_text = self.current_input_sequence_end_text
         self.input_edit_refresh_timer.stop()
         self.input_edit.blockSignals(True)
         self.input_edit.setText(str(selected.input_path))
@@ -2080,16 +2268,36 @@ class MainWindow(QMainWindow):
         self.refresh_audio_controls()
         self._prepare_preview_source(selected.preview_path, selected.is_sequence)
         self.refresh_color_transform_defaults()
+        next_output_path = self._auto_output_path(
+            selected.input_path,
+            self.current_preset(),
+            output_transform=self.selected_output_transform(),
+            sequence_start=selected.sequence_start,
+            sequence_end=selected.sequence_end,
+            sequence_start_text=selected.sequence_start_text,
+            sequence_end_text=selected.sequence_end_text,
+        )
         if not self.output_path_is_manual or not self.output_edit.text().strip():
-            self.output_edit.setText(_default_output_path(
-                selected.input_path,
-                self.current_preset(),
-                output_transform=self.selected_output_transform(),
-                sequence_start=selected.sequence_start,
-                sequence_end=selected.sequence_end,
-                sequence_start_text=selected.sequence_start_text,
-                sequence_end_text=selected.sequence_end_text,
-            ))
+            self.output_edit.setText(next_output_path)
+        else:
+            followed_output_path = _manual_output_path_for_new_input(
+                current_output_text=previous_output_text,
+                previous_input_path=previous_input_path,
+                next_input_path=selected.input_path,
+                preset=self.current_preset(),
+                previous_output_transform=previous_output_transform,
+                next_output_transform=self.selected_output_transform(),
+                previous_sequence_start=previous_sequence_start,
+                previous_sequence_end=previous_sequence_end,
+                previous_sequence_start_text=previous_sequence_start_text,
+                previous_sequence_end_text=previous_sequence_end_text,
+                next_sequence_start=selected.sequence_start,
+                next_sequence_end=selected.sequence_end,
+                next_sequence_start_text=selected.sequence_start_text,
+                next_sequence_end_text=selected.sequence_end_text,
+            )
+            if followed_output_path is not None:
+                self.output_edit.setText(followed_output_path)
         self.refresh_fps_control_visibility()
         self.probe_input(selected.preview_path)
         self._remember_directory("last_video_input_dir", selected.input_path.parent)
@@ -2139,6 +2347,8 @@ class MainWindow(QMainWindow):
 
     def mark_output_path_manual(self) -> None:
         self.output_path_is_manual = bool(self.output_edit.text().strip())
+        if self.output_path_is_manual:
+            self.output_directory_override = None
 
     def mark_fps_manual(self) -> None:
         self.fps_value_is_manual = bool(self.fps_edit.text().strip())
@@ -2175,7 +2385,7 @@ class MainWindow(QMainWindow):
         self.refresh_color_transform_defaults()
         self.refresh_fps_control_visibility()
         if not self.output_path_is_manual or not self.output_edit.text().strip():
-            self.output_edit.setText(_default_output_path(
+            self.output_edit.setText(self._auto_output_path(
                 input_path,
                 self.current_preset(),
                 output_transform=self.selected_output_transform(),
@@ -2208,13 +2418,64 @@ class MainWindow(QMainWindow):
                 return path.parent
         return self._last_directory("last_video_input_dir", Path.home())
 
+    def _auto_output_path(
+        self,
+        input_path: Path,
+        preset: Preset,
+        *,
+        output_transform: str | None = None,
+        sequence_start: int | None = None,
+        sequence_end: int | None = None,
+        sequence_start_text: str | None = None,
+        sequence_end_text: str | None = None,
+    ) -> str:
+        output_path = Path(_default_output_path(
+            input_path,
+            preset,
+            output_transform=output_transform,
+            sequence_start=sequence_start,
+            sequence_end=sequence_end,
+            sequence_start_text=sequence_start_text,
+            sequence_end_text=sequence_end_text,
+        ))
+        if self.output_directory_override is not None:
+            output_path = self.output_directory_override / output_path.name
+        return str(output_path)
+
     def browse_output(self) -> None:
         current = self.output_edit.text().strip()
         start_path = str(Path(current).expanduser()) if current else ""
         path, _ = QFileDialog.getSaveFileName(self, "Choose output file", start_path)
         if path:
-            self.output_edit.setText(path)
-            self.output_path_is_manual = True
+            selected_path = Path(path).expanduser()
+            input_text = self.input_edit.text().strip()
+            auto_output_name = None
+            if input_text:
+                auto_output_name = Path(_default_output_path(
+                    Path(input_text).expanduser(),
+                    self.current_preset(),
+                    output_transform=self.selected_output_transform(),
+                    sequence_start=self.current_input_sequence_start,
+                    sequence_end=self.current_input_sequence_end,
+                    sequence_start_text=self.current_input_sequence_start_text,
+                    sequence_end_text=self.current_input_sequence_end_text,
+                )).name
+            if auto_output_name and selected_path.name == auto_output_name:
+                self.output_directory_override = selected_path.parent
+                self.output_path_is_manual = False
+                self.output_edit.setText(self._auto_output_path(
+                    Path(input_text).expanduser(),
+                    self.current_preset(),
+                    output_transform=self.selected_output_transform(),
+                    sequence_start=self.current_input_sequence_start,
+                    sequence_end=self.current_input_sequence_end,
+                    sequence_start_text=self.current_input_sequence_start_text,
+                    sequence_end_text=self.current_input_sequence_end_text,
+                ))
+            else:
+                self.output_directory_override = None
+                self.output_edit.setText(path)
+                self.output_path_is_manual = True
 
     def probe_input(self, input_path: Path | None = None, *, show_errors: bool = True) -> None:
         input_path = input_path or Path(self.input_edit.text()).expanduser()
@@ -2481,7 +2742,7 @@ class MainWindow(QMainWindow):
         current_output = self.output_edit.text().strip()
         if not current_output:
             self.output_path_is_manual = False
-            self.output_edit.setText(_default_output_path(
+            self.output_edit.setText(self._auto_output_path(
                 Path(self.input_edit.text()),
                 self.current_preset(),
                 output_transform=self.selected_output_transform(),
@@ -2908,16 +3169,25 @@ class MainWindow(QMainWindow):
         return QSize(self.output_width_spin.value(), self.output_height_spin.value())
 
     def base_output_raster_size(self) -> QSize | None:
-        if not self.current_source_raster_size:
+        source_size = self._source_raster_size_for_output()
+        if not source_size:
             return None
-        width = self.current_source_raster_size.width()
-        height = self.current_source_raster_size.height()
+        width = source_size.width()
+        height = source_size.height()
         if width <= 0 or height <= 0:
             return None
         if self.selected_anamorph_output_mode() == ANAMORPH_OUTPUT_BAKE:
             pixel_aspect = self.selected_pixel_aspect_for_path(self._current_preview_frame_path())
             width = _rounded_output_dimension(width * pixel_aspect, 1)
         return QSize(width, height)
+
+    def _source_raster_size_for_output(self) -> QSize | None:
+        probed_size = _video_size_from_probe(self.current_probe_json) if self.current_probe_json else None
+        if probed_size and probed_size.width() > 0 and probed_size.height() > 0:
+            return probed_size
+        if self.current_source_raster_size and self.current_source_raster_size.width() > 0 and self.current_source_raster_size.height() > 0:
+            return QSize(self.current_source_raster_size)
+        return None
 
     def output_dimension_multiple(self) -> int:
         return 8 if self.selected_file_type() == "mp4" else 1
@@ -3234,11 +3504,13 @@ class MainWindow(QMainWindow):
             self.queue_run_all_active = False
             self.current_worker.cancel()
             self.progress_label.setText("Stop requested")
+            self.stop_convert_button.setEnabled(False)
             return
         self.queue_run_all_active = False
         self.queue_pause_requested = False
         self.start_queue_button.setText("Start All Jobs")
         self.progress_label.setText("Queue stopped")
+        self.stop_convert_button.setEnabled(False)
 
     def _start_next_active_queue_job(self) -> None:
         for row in range(self.queue_table.rowCount()):
@@ -3299,6 +3571,7 @@ class MainWindow(QMainWindow):
         self.current_worker.log_line.connect(self.append_log)
         self.current_worker.finished_with_code.connect(lambda code: self._conversion_finished(row, code, continue_queue))
         self.current_worker.failed.connect(lambda message, trace: self._conversion_failed(row, message, continue_queue, trace))
+        self.stop_convert_button.setEnabled(True)
         self.current_worker.start()
 
     def unsupported_input_reason_for_job(self, job: ConvertJob) -> str | None:
@@ -3357,6 +3630,7 @@ class MainWindow(QMainWindow):
         self.append_log("")
         self.append_log(status)
         self.current_worker = None
+        self.stop_convert_button.setEnabled(False)
         if continue_queue and self.queue_run_all_active and not self.queue_pause_requested and not self.queue_cancel_requested:
             QTimer.singleShot(0, self._start_next_active_queue_job)
             return
@@ -3384,6 +3658,7 @@ class MainWindow(QMainWindow):
             traceback_text=traceback_text,
         )
         self.current_worker = None
+        self.stop_convert_button.setEnabled(False)
         if continue_queue and self.queue_run_all_active and not self.queue_pause_requested and not self.queue_cancel_requested:
             QTimer.singleShot(0, self._start_next_active_queue_job)
             return
@@ -3402,6 +3677,8 @@ class MainWindow(QMainWindow):
         self.sequence_frame_index = 0
         self.preview_source_path = path
         self.preview_is_sequence = is_sequence
+        self.preview_proxy_path = None
+        self.preview_proxy_requested_for = None
         self.current_source_raster_size = None
         self.refresh_scale_controls()
         self.position_slider.setValue(0)
@@ -3469,6 +3746,7 @@ class MainWindow(QMainWindow):
         self.player.setAudioOutput(self.audio_output)
         self.player.setVideoSink(self.video_sink)
         self.player.mediaStatusChanged.connect(self.handle_media_status)
+        self.player.errorOccurred.connect(self.handle_player_error)
         self.video_sink.videoFrameChanged.connect(self.handle_video_frame_changed)
         self.preview_placeholder.show()
         if self.preview_layout.indexOf(self.preview_placeholder) == -1:
@@ -3478,7 +3756,8 @@ class MainWindow(QMainWindow):
         self.player.durationChanged.connect(self.position_slider.setMaximum)
         self.position_slider.setEnabled(True)
 
-        self.player.setSource(QUrl.fromLocalFile(str(self.preview_source_path)))
+        source_path = self.preview_proxy_path or self.preview_source_path
+        self.player.setSource(QUrl.fromLocalFile(str(source_path)))
 
     def handle_video_frame_changed(self, frame: QVideoFrame) -> None:
         image = frame.toImage()
@@ -3551,7 +3830,7 @@ class MainWindow(QMainWindow):
             return
         self.sequence_frame_index = max(0, min(index, len(self.sequence_preview_frames) - 1))
         frame = self.sequence_preview_frames[self.sequence_frame_index]
-        pixmap = QPixmap(str(frame))
+        pixmap = _preview_pixmap_for_path(frame)
         self.preview_placeholder.clear()
         if pixmap.isNull():
             self.preview_placeholder.setText(frame.name)
@@ -3592,6 +3871,74 @@ class MainWindow(QMainWindow):
     def handle_media_status(self, status: QMediaPlayer.MediaStatus) -> None:
         if status == QMediaPlayer.MediaStatus.EndOfMedia:
             self.reset_preview_after_finished()
+
+    def handle_player_error(self, error, error_text: str) -> None:  # noqa: ANN001 - Qt enum differs by binding version.
+        if error == QMediaPlayer.Error.NoError:
+            return
+        source_path = self.preview_source_path
+        if (
+            error == QMediaPlayer.Error.FormatError
+            and source_path is not None
+            and not self.preview_is_sequence
+            and not _is_still_image_path(source_path)
+            and self.preview_proxy_path is None
+            and self.preview_proxy_requested_for != source_path
+        ):
+            self.start_preview_proxy_generation(source_path)
+            return
+
+        message = error_text or "Preview failed."
+        self.preview_placeholder.setText(message)
+        self.preview_placeholder.show()
+        self.play_button.setText("Play")
+        self.record_error("Preview failed", message)
+        self.progress_label.setText("Preview failed")
+
+    def start_preview_proxy_generation(self, source_path: Path) -> None:
+        worker = self.preview_proxy_worker
+        if worker is not None and worker.isRunning():
+            return
+        self.preview_proxy_requested_for = source_path
+        self.progress_label.setText("Preparing preview proxy...")
+        self.preview_placeholder.setText("Unsupported source codec in Qt backend. Preparing preview proxy...")
+        self.play_button.setText("Play")
+        self.play_button.setEnabled(False)
+        worker = PreviewProxyWorker(source_path)
+        worker.ready.connect(self.handle_preview_proxy_ready)
+        worker.failed.connect(self.handle_preview_proxy_failed)
+        self.preview_proxy_worker = worker
+        worker.start()
+
+    def handle_preview_proxy_ready(self, source_path: str, proxy_path: str) -> None:
+        self.play_button.setEnabled(True)
+        self.preview_proxy_worker = None
+        current_source = self.preview_source_path
+        if current_source is None or str(current_source) != source_path:
+            return
+        self.preview_proxy_path = Path(proxy_path)
+        self.progress_label.setText("Preview proxy ready")
+        self.preview_placeholder.setText("Preview proxy ready")
+        if self.player:
+            self.player.stop()
+            self.player.setSource(QUrl())
+            self.player.deleteLater()
+            self.player = None
+            self.audio_output = None
+            self.video_sink = None
+        self._start_preview_source()
+        if self.player:
+            self.player.play()
+            self.play_button.setText("Pause")
+
+    def handle_preview_proxy_failed(self, source_path: str, message: str, traceback_text: str) -> None:
+        self.play_button.setEnabled(True)
+        self.preview_proxy_worker = None
+        current_source = self.preview_source_path
+        if current_source is None or str(current_source) != source_path:
+            return
+        self.progress_label.setText("Preview proxy failed")
+        self.preview_placeholder.setText(message)
+        self.record_error("Preview proxy failed", message, traceback_text=traceback_text)
 
     def reset_preview_after_finished(self) -> None:
         self.sequence_timer.stop()
@@ -4112,6 +4459,108 @@ def _cached_exr_pixel_aspect_ratio(path: str, _mtime_ns: int) -> float:
             close()
 
 
+def _preview_pixmap_for_path(path: Path) -> QPixmap:
+    pixmap = QPixmap(str(path))
+    if not pixmap.isNull() or path.suffix.lower() != ".exr":
+        return pixmap
+    return _load_exr_preview_pixmap(path)
+
+
+def _load_exr_preview_pixmap(path: Path) -> QPixmap:
+    if np is None or not path.exists() or path.suffix.lower() != ".exr":
+        return QPixmap()
+    try:
+        stat = path.stat()
+    except OSError:
+        return QPixmap()
+    image = _cached_exr_preview_image(str(path), stat.st_mtime_ns)
+    if image is None or image.isNull():
+        return QPixmap()
+    return QPixmap.fromImage(image)
+
+
+@lru_cache(maxsize=128)
+def _cached_exr_preview_image(path: str, _mtime_ns: int) -> QImage | None:
+    if np is None:
+        return None
+    try:
+        import Imath  # noqa: PLC0415
+        import OpenEXR  # noqa: PLC0415
+    except Exception:  # noqa: BLE001 - EXR preview fallback is optional.
+        return None
+
+    try:
+        file_object = OpenEXR.InputFile(path)
+    except Exception:  # noqa: BLE001 - invalid EXR should not break preview.
+        return None
+
+    try:
+        header = file_object.header()
+        data_window = header.get("dataWindow")
+        if data_window is None:
+            return None
+        width = data_window.max.x - data_window.min.x + 1
+        height = data_window.max.y - data_window.min.y + 1
+        if width <= 0 or height <= 0:
+            return None
+
+        channels = header.get("channels", {})
+        if not isinstance(channels, dict) or not channels:
+            return None
+        channel_names = tuple(str(name) for name in channels.keys())
+        red_name = _exr_channel_name(channel_names, "R")
+        green_name = _exr_channel_name(channel_names, "G")
+        blue_name = _exr_channel_name(channel_names, "B")
+        alpha_name = _exr_channel_name(channel_names, "A")
+        luma_name = _exr_channel_name(channel_names, "Y")
+
+        pixel_type = Imath.PixelType(Imath.PixelType.FLOAT)
+        if red_name and green_name and blue_name:
+            red = _exr_channel_array(file_object, red_name, pixel_type, width, height)
+            green = _exr_channel_array(file_object, green_name, pixel_type, width, height)
+            blue = _exr_channel_array(file_object, blue_name, pixel_type, width, height)
+        elif luma_name:
+            luma = _exr_channel_array(file_object, luma_name, pixel_type, width, height)
+            red = green = blue = luma
+        else:
+            return None
+
+        alpha = (
+            _exr_channel_array(file_object, alpha_name, pixel_type, width, height)
+            if alpha_name
+            else np.ones((height, width), dtype=np.float32)
+        )
+        rgba = np.stack((red, green, blue, alpha), axis=-1)
+        np.nan_to_num(rgba, copy=False, nan=0.0, posinf=1.0, neginf=0.0)
+        np.clip(rgba, 0.0, 1.0, out=rgba)
+        rgba_u8 = np.rint(rgba * 255.0).astype(np.uint8)
+        image = QImage(rgba_u8.data, width, height, width * 4, QImage.Format.Format_RGBA8888)
+        return image.copy()
+    except Exception:  # noqa: BLE001 - EXR preview fallback must not break UI.
+        return None
+    finally:
+        close = getattr(file_object, "close", None)
+        if callable(close):
+            close()
+
+
+def _exr_channel_name(channel_names: tuple[str, ...], target: str) -> str | None:
+    target_upper = target.upper()
+    for name in channel_names:
+        if name.upper() == target_upper:
+            return name
+    for name in channel_names:
+        upper_name = name.upper()
+        if upper_name.endswith(f".{target_upper}") or upper_name.endswith(f"_{target_upper}"):
+            return name
+    return None
+
+
+def _exr_channel_array(file_object, channel_name: str, pixel_type, width: int, height: int):  # noqa: ANN001
+    data = file_object.channel(channel_name, pixel_type)
+    return np.frombuffer(data, dtype=np.float32).reshape((height, width))
+
+
 def _jpeg_quality_percent_to_qscale(value: int) -> int:
     clamped = max(0, min(100, value))
     return round(31 - (clamped / 100) * 29)
@@ -4275,6 +4724,16 @@ def _ocio_lut_is_required(input_transform: str, output_transform: str) -> bool:
     return bool(input_color_space and output_color_space and input_color_space != output_color_space)
 
 
+def _preview_proxy_path(source_path: Path) -> Path:
+    try:
+        stat = source_path.stat()
+        stamp = f"{stat.st_mtime_ns}:{stat.st_size}"
+    except OSError:
+        stamp = "missing"
+    cache_key = hashlib.sha1(f"preview-proxy-v1|{source_path.resolve()}|{stamp}".encode("utf-8")).hexdigest()
+    return Path(tempfile.gettempdir()) / "7th-convert" / "preview_proxy" / f"{cache_key}.mp4"
+
+
 def _ocio_color_space_name(value: str) -> str | None:
     if not value.startswith("ocio:"):
         return None
@@ -4369,6 +4828,48 @@ def _default_output_path(
     if preset.output.get("requires_pattern"):
         return str(input_path.with_name(f"{stem}.%04d.{extension}"))
     return str(input_path.with_name(f"{stem}.{extension}"))
+
+
+def _manual_output_path_for_new_input(
+    current_output_text: str,
+    previous_input_path: Path | None,
+    next_input_path: Path,
+    preset: Preset,
+    previous_output_transform: str | None = None,
+    next_output_transform: str | None = None,
+    previous_sequence_start: int | None = None,
+    previous_sequence_end: int | None = None,
+    previous_sequence_start_text: str | None = None,
+    previous_sequence_end_text: str | None = None,
+    next_sequence_start: int | None = None,
+    next_sequence_end: int | None = None,
+    next_sequence_start_text: str | None = None,
+    next_sequence_end_text: str | None = None,
+) -> str | None:
+    if not current_output_text or previous_input_path is None:
+        return None
+    current_output = Path(current_output_text).expanduser()
+    previous_default = Path(_default_output_path(
+        previous_input_path,
+        preset,
+        output_transform=previous_output_transform,
+        sequence_start=previous_sequence_start,
+        sequence_end=previous_sequence_end,
+        sequence_start_text=previous_sequence_start_text,
+        sequence_end_text=previous_sequence_end_text,
+    ))
+    if current_output.name != previous_default.name:
+        return None
+    next_default = Path(_default_output_path(
+        next_input_path,
+        preset,
+        output_transform=next_output_transform,
+        sequence_start=next_sequence_start,
+        sequence_end=next_sequence_end,
+        sequence_start_text=next_sequence_start_text,
+        sequence_end_text=next_sequence_end_text,
+    ))
+    return str(current_output.with_name(next_default.name))
 
 
 def _clean_sequence_stem(stem: str) -> str:
