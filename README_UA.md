@@ -63,11 +63,18 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 ./7th-vfx-convertor.sh
 ```
 
-Windows PowerShell:
+Windows (рекомендовано: `git clone` вмикає self-update):
 
 ```powershell
 git clone https://github.com/Slavich86/7th-convert.git
 cd 7th-convert
+.\7th-vfx-convertor.bat
+```
+
+Можна також встановити `uv` вручну і запустити launcher:
+
+```powershell
+winget install astral-sh.uv
 .\7th-vfx-convertor.bat
 ```
 
