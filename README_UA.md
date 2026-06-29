@@ -3,13 +3,13 @@
 </p>
 
 <p align="center">
-  <strong>Десктопний VFX media converter для Linux.</strong>
+  <strong>Десктопний VFX media converter для Linux та Windows.</strong>
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.11%2B-blue" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/UI-Qt%206-green" alt="Qt 6">
-  <img src="https://img.shields.io/badge/Platform-Linux-lightgrey" alt="Linux">
+  <img src="https://img.shields.io/badge/Platform-Linux%20%2F%20Windows-lightgrey" alt="Linux / Windows">
   <img src="https://img.shields.io/github/v/release/Slavich86/7th-convert?include_prereleases" alt="Release">
 </p>
 
@@ -66,9 +66,12 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 Windows PowerShell:
 
 ```powershell
-winget install astral-sh.uv
+git clone https://github.com/Slavich86/7th-convert.git
+cd 7th-convert
 .\7th-vfx-convertor.bat
 ```
+
+`.bat` launcher перевіряє `python`, `ffmpeg`, `ffprobe` та `uv`. Якщо `ffmpeg` або `uv` відсутні — пропонує встановити їх автоматично через `winget`.
 
 Launcher створює:
 
@@ -156,6 +159,10 @@ Windows:
 - Показувати Media Info і Metadata.
 - Перетягувати файли через Drag and Drop.
 - Відкривати output folder після конвертації.
+- Перевіряти та автоматично оновлювати конвертер з GitHub.
+- Автоматично встановлювати залежності (ffmpeg, uv) на Windows через winget.
+- Preview proxy для кодеків без нативної підтримки Qt (напр. ProRes на Windows).
+- EXR preview через OpenEXR, коли Qt image plugin недоступний.
 
 ## Підтримувані input файли
 

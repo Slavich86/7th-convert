@@ -3,13 +3,13 @@
 </p>
 
 <p align="center">
-  <strong>Desktop VFX media converter for Linux.</strong>
+  <strong>Desktop VFX media converter for Linux and Windows.</strong>
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.11%2B-blue" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/UI-Qt%206-green" alt="Qt 6">
-  <img src="https://img.shields.io/badge/Platform-Linux-lightgrey" alt="Linux">
+  <img src="https://img.shields.io/badge/Platform-Linux%20%2F%20Windows-lightgrey" alt="Linux / Windows">
   <img src="https://img.shields.io/github/v/release/Slavich86/7th-convert?include_prereleases" alt="Release">
 </p>
 
@@ -66,9 +66,12 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 Windows PowerShell:
 
 ```powershell
-winget install astral-sh.uv
+git clone https://github.com/Slavich86/7th-convert.git
+cd 7th-convert
 .\7th-vfx-convertor.bat
 ```
+
+The `.bat` launcher checks for `python`, `ffmpeg`, `ffprobe`, and `uv`. If `ffmpeg` or `uv` are missing, it offers to install them automatically through `winget`.
 
 The launcher creates:
 
@@ -156,6 +159,10 @@ The `.desktop` file is for Linux and expects `7th-vfx-convertor.sh` to be in the
 - Show Media Info and Metadata.
 - Load files through Drag and Drop.
 - Open the output folder after conversion.
+- Check for updates and update automatically from GitHub.
+- Auto-install missing dependencies (ffmpeg, uv) on Windows via winget.
+- Preview proxy for codecs without native Qt player support (e.g. ProRes on Windows).
+- EXR preview fallback through OpenEXR when Qt image plugin is unavailable.
 
 ## Supported Input Files
 
