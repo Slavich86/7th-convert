@@ -20,7 +20,7 @@ from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, QPoint, QSize, QSettings, Qt, QThread, QTimer, QUrl, Signal, qVersion
+from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QSize, QSettings, Qt, QThread, QTimer, QUrl, Signal, qVersion
 from PySide6.QtGui import QAction, QColor, QColorSpace, QDesktopServices, QIcon, QImage, QKeyEvent, QKeySequence, QPainter, QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoFrame, QVideoSink
 from PySide6.QtMultimediaWidgets import QVideoWidget
@@ -51,6 +51,8 @@ from PySide6.QtWidgets import (
     QSlider,
     QSpinBox,
     QSplitter,
+    QStyle,
+    QStyleOptionSlider,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -646,9 +648,12 @@ class TimelineSlider(QSlider):
             return
         left = min(start_x, end_x)
         width = abs(end_x - start_x)
+        groove = self._slider_groove_rect()
+        track_height = max(groove.height(), 6)
+        top = groove.center().y() - track_height // 2
         color = QColor("#ff9d00")
-        color.setAlpha(95)
-        painter.fillRect(left, 5, width, max(self.height() - 10, 1), color)
+        color.setAlpha(180)
+        painter.fillRect(QRect(left, top, width, track_height), color)
 
     def _draw_marker(self, painter: QPainter, value_ms: int | None, color: QColor) -> None:
         if value_ms is None:
@@ -670,9 +675,20 @@ class TimelineSlider(QSlider):
             return None
         slider_value = self.marker_to_slider_value(value_ms) if self.marker_to_slider_value else value_ms
         value = max(minimum, min(maximum, slider_value))
-        ratio = (value - minimum) / (maximum - minimum)
-        margin = 8
-        return round(margin + ratio * max(self.width() - margin * 2, 1))
+        groove = self._slider_groove_rect()
+        option = QStyleOptionSlider()
+        self.initStyleOption(option)
+        span = max(groove.width() - 1, 1)
+        position = QStyle.sliderPositionFromValue(minimum, maximum, value, span, option.upsideDown)
+        return groove.left() + position
+
+    def _slider_groove_rect(self) -> QRect:
+        option = QStyleOptionSlider()
+        self.initStyleOption(option)
+        groove = self.style().subControlRect(QStyle.ComplexControl.CC_Slider, option, QStyle.SubControl.SC_SliderGroove, self)
+        if groove.isValid():
+            return groove
+        return QRect(8, self.height() // 2 - 3, max(self.width() - 16, 1), 6)
 
 
 class PreviewLabel(QLabel):
