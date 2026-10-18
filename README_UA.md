@@ -37,16 +37,16 @@
 
 Для кожної ОС/процесора потрібна нативна збірка плеєра. Встановіть Rust/Cargo через [rustup](https://rustup.rs/) та засоби компонування своєї ОС: MSVC Build Tools для Windows або Apple Command Line Tools для macOS. Toolchain зафіксований у `rust/player/rust-toolchain.toml`.
 
-Launchers збирають плеєр за наявності Cargo та повторно використовують актуальний сумісний бінарник. Явна збірка у підготовленому середовищі:
+Запускайте конвертор через launcher своєї платформи: він готує локальне середовище, збирає Rust-плеєр за наявності Cargo та відкриває програму. Актуальний сумісний бінарник використовується повторно; вводити Python-команди вручну не потрібно.
 
 ```bash
 # Linux / macOS
-.venv/bin/python -m seventh_convert.build_player
+./7th-vfx-convertor.sh
 ```
 
 ```powershell
 # Windows
-.venv\Scripts\python.exe -m seventh_convert.build_player
+.\7th-vfx-convertor.bat
 ```
 
 Виконуваний файл встановлюється в `seventh_convert/bin/`. Для запуску готової сумісної збірки Cargo не потрібен. Якщо немає ні сумісного бінарника, ні Cargo, launcher повідомляє про використання Qt preview. Помилка збірки Cargo зупиняє запуск із діагностикою.
@@ -89,15 +89,15 @@ chmod +x 7th-vfx-convertor.sh
 
 ```bash
 brew install python@3.13 uv ffmpeg
-chmod +x 7th-vfx-convertor.command 7th-vfx-convertor.sh
-./7th-vfx-convertor.command
+chmod +x 7th-vfx-convertor.sh
+./7th-vfx-convertor.sh
 ```
 
-Також можна двічі натиснути `.command` у Finder; він має лежати поруч із `.sh`. Launcher враховує шляхи Homebrew для Apple Silicon та Intel. Для нативного Rust-плеєра встановіть Cargo й Apple Command Line Tools (`xcode-select --install`). Підписаного/notarized `.app` у комплекті немає.
+Для запуску через Finder також можна надати `7th-vfx-convertor.command` право виконання й двічі натиснути його: він запускає той самий `.sh` і має лежати поруч із ним. Launcher враховує шляхи Homebrew для Apple Silicon та Intel. Для нативного Rust-плеєра встановіть Cargo й Apple Command Line Tools (`xcode-select --install`). Підписаного/notarized `.app` у комплекті немає.
 
 **Перевірка платформ:** відтворення та інтеграційні перевірки виконувалися на Linux. Launchers для Windows і macOS включені, проте встановлення та playback на справжніх Windows/macOS ще потребують перевірки.
 
-Launchers знаходять файли відносно власної теки, включно зі шляхами з пробілами. Прямий запуск у вже підготовленому середовищі: `.venv/bin/python -m seventh_convert.ui` (Windows: `.venv\Scripts\python.exe -m seventh_convert.ui`).
+Launchers знаходять файли відносно власної теки, включно зі шляхами з пробілами. На Windows також можна двічі натиснути `7th-vfx-convertor.bat`.
 
 `Help → Check for Updates` потребує Git-клону. ZIP-архіви та перенесений вміст `publish/` не мають `.git` і не можуть оновлюватися цим способом.
 

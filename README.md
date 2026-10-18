@@ -37,16 +37,16 @@ Preview uses an 8-bit RGBA display buffer sized for the viewport. This does not 
 
 A native player build is required for each OS/CPU. Install Rust/Cargo using [rustup](https://rustup.rs/) and native linker/build tools (MSVC Build Tools on Windows; Apple Command Line Tools on macOS). The pinned toolchain is in `rust/player/rust-toolchain.toml`.
 
-Launchers build the player when Cargo is available and reuse a current compatible binary. To build explicitly in the prepared environment:
+Use the platform launcher to prepare the local environment, build the Rust player when Cargo is available, and start the converter. A current compatible player binary is reused automatically; no manual Python command is needed.
 
 ```bash
 # Linux / macOS
-.venv/bin/python -m seventh_convert.build_player
+./7th-vfx-convertor.sh
 ```
 
 ```powershell
 # Windows
-.venv\Scripts\python.exe -m seventh_convert.build_player
+.\7th-vfx-convertor.bat
 ```
 
 The executable is installed in `seventh_convert/bin/`. Cargo is not needed to run an existing compatible build. If neither a compatible binary nor Cargo is available, the launcher reports use of Qt preview. A Cargo build failure stops startup and shows diagnostics.
@@ -89,15 +89,15 @@ With [Homebrew](https://docs.brew.sh/Installation) installed:
 
 ```bash
 brew install python@3.13 uv ffmpeg
-chmod +x 7th-vfx-convertor.command 7th-vfx-convertor.sh
-./7th-vfx-convertor.command
+chmod +x 7th-vfx-convertor.sh
+./7th-vfx-convertor.sh
 ```
 
-You can also double-click `.command` in Finder; keep it beside `.sh`. The launcher includes Homebrew paths for Apple Silicon and Intel. To build the native Rust player, install Cargo and Apple Command Line Tools (`xcode-select --install`). A signed/notarized `.app` is not included.
+Alternatively, make `7th-vfx-convertor.command` executable and double-click it in Finder; it starts the same `.sh` launcher and must stay beside it. The launcher includes Homebrew paths for Apple Silicon and Intel. To build the native Rust player, install Cargo and Apple Command Line Tools (`xcode-select --install`). A signed/notarized `.app` is not included.
 
 **Platform verification:** playback and integration checks have run on Linux. Windows and macOS launchers are included, but installation and playback on actual Windows/macOS machines still need verification.
 
-Launchers resolve paths relative to their own folder, including paths containing spaces. Direct UI startup in an already prepared environment is also available: `.venv/bin/python -m seventh_convert.ui` (Windows: `.venv\Scripts\python.exe -m seventh_convert.ui`).
+Launchers resolve paths relative to their own folder, including paths containing spaces. On Windows, you can also double-click `7th-vfx-convertor.bat`.
 
 `Help → Check for Updates` requires a Git clone. ZIP downloads and copied `publish/` contents have no `.git` directory and cannot self-update this way.
 
