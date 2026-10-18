@@ -3,346 +3,149 @@
 </p>
 
 <p align="center">
-  <strong>Desktop VFX media converter for Linux and Windows.</strong>
-</p>
-
-<p align="center">
+  <img src="https://img.shields.io/badge/Player-Rust-orange" alt="Rust player">
   <img src="https://img.shields.io/badge/Python-3.11%2B-blue" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/UI-Qt%206-green" alt="Qt 6">
-  <img src="https://img.shields.io/badge/Platform-Linux%20%2F%20Windows-lightgrey" alt="Linux / Windows">
-  <img src="https://img.shields.io/github/v/release/Slavich86/7th-convert?include_prereleases" alt="Release">
 </p>
 
-<p align="center">
-  <a href="#install-system-dependencies">Install</a> &bull;
-  <a href="#run">Run</a> &bull;
-  <a href="#supported-input-files">Input Formats</a> &bull;
-  <a href="#supported-output-formats">Output Formats</a> &bull;
-  <a href="#hotkeys">Hotkeys</a> &bull;
-  <a href="README_UA.md">Українська</a>
-</p>
+# 7th VFX convertor
 
----
+Desktop converter for VFX video, image sequences, still images and audio, with a **Rust preview player**, a Python/PySide6 (Qt 6) interface and FFmpeg conversion.
 
-**7th VFX convertor** is a desktop media converter for VFX workflows.
-
-The application is built for converting video, image sequences, still images, and audio with control over color transforms, output size, pixel aspect, In/Out ranges, and presets.
-
-The current version is written in Python with a Qt 6 Widgets UI and uses `ffmpeg` / `ffprobe` for media analysis and conversion.
+[Українська](README_UA.md) · [Install and run](#install-and-run) · [Rust player](#rust-player) · [Formats](#formats) · [Clean distribution](#clean-distribution)
 
 ![7th VFX convertor main window](docs/images/main-window.png)
 
-## Install System Dependencies
-
-`ffmpeg` and `ffprobe` must be installed on the system and available on `PATH`.
-
-Linux distribution | Command
---- | ---
-Fedora, official free build | `sudo dnf install ffmpeg-free`
-Fedora, RPM Fusion / full codecs | `sudo dnf install ffmpeg --allowerasing`
-Ubuntu | `sudo apt update && sudo apt install ffmpeg`
-Debian | `sudo apt update && sudo apt install ffmpeg`
-Linux Mint | `sudo apt update && sudo apt install ffmpeg`
-Pop!_OS | `sudo apt update && sudo apt install ffmpeg`
-Arch Linux | `sudo pacman -S ffmpeg`
-Manjaro | `sudo pacman -S ffmpeg`
-EndeavourOS | `sudo pacman -S ffmpeg`
-openSUSE Tumbleweed / Leap | `sudo zypper install ffmpeg`
-Alpine Linux | `sudo apk add ffmpeg`
-
-## Install Python Dependencies
-
-Python 3.11+ is required.
-
-Recommended: install `uv`, then let the launcher create `.venv` and install Python dependencies there:
-
-Linux:
-
-```bash
-git clone https://github.com/Slavich86/7th-convert.git
-cd 7th-convert
-./7th-vfx-convertor.sh
-```
-
-Windows:
-
-```powershell
-git clone https://github.com/Slavich86/7th-convert.git
-cd 7th-convert
-.\7th-vfx-convertor.bat
-```
-
-The launcher checks for `python`, `ffmpeg`, `ffprobe`, and `uv`. If `ffmpeg` or `uv` are missing on Windows, it offers to install them automatically through `winget`. On Linux, install `ffmpeg` through your package manager.
-
-> **Self-update** (`Help → Check for Updates`) works only when the converter
-> is installed via `git clone`. ZIP downloads do not include the `.git` folder
-> required for automatic updates.
-
-The launcher creates:
-
-```text
-.venv/
-```
-
-and installs:
-
-```bash
-uv pip install --python .venv/bin/python --link-mode=copy -r requirements.txt
-```
-
-Fallback without `uv`:
-
-Linux:
-
-```bash
-python3 -m pip install -r requirements.txt
-```
-
-Windows:
-
-```powershell
-python -m pip install -r requirements.txt
-```
-
-## Run
-
-Recommended launch from the repository root:
-
-Linux:
-
-```bash
-./7th-vfx-convertor.sh
-```
-
-Windows:
-
-```powershell
-.\7th-vfx-convertor.bat
-```
-
-The launcher checks required system tools and Python modules before starting the UI.
-When `uv` is available, it prepares the local `.venv` automatically and runs the UI through the `.venv` Python interpreter.
-
-Direct Python launch is also available:
-
-Linux:
-
-```bash
-.venv/bin/python -m seventh_convert.ui
-```
-
-Windows:
-
-```powershell
-.venv\Scripts\python.exe -m seventh_convert.ui
-```
-
-## Desktop Launcher
-
-The repository includes:
-
-```text
-7th-vfx-convertor.bat
-7th-vfx-convertor.desktop
-7th-vfx-convertor.sh
-```
-
-The `.desktop` file is for Linux and expects `7th-vfx-convertor.sh` to be in the same directory. If your file manager blocks launching desktop files, mark both files as executable or run the shell launcher directly. On Windows, use `7th-vfx-convertor.bat`.
-
 ## Features
 
-- Open video files, still images, image sequences, and audio files.
-- Automatically detect image sequences.
-- Split image sequences into separate ranges when frames are missing.
-- Preview media in the built-in player.
-- Show the current frame.
-- Set In / Out markers.
-- Convert a full file or only the selected range.
-- For video → image sequence, save the first frame and every Nth frame with global source-frame numbering, for example `0001`, `0005`, `0010` with `Frame Step = 5`.
-- Convert multiple jobs through the queue.
-- Save and load user presets.
-- Remember the last folders for video/image input, audio input, and presets.
-- Show Media Info and Metadata.
-- Load files through Drag and Drop.
-- Open the output folder after conversion.
-- Check for updates and update automatically from GitHub.
-- Auto-install missing dependencies (ffmpeg, uv) on Windows via winget.
-- Preview proxy for codecs without native Qt player support (e.g. ProRes on Windows).
-- EXR preview fallback through OpenEXR when Qt image plugin is unavailable.
+- Video and image-sequence playback, seeking, frame stepping and In/Out markers through the Rust player.
+- Sequence detection, original frame numbering and separate ranges for sequences with missing frames.
+- Full-source or selected-range conversion, batch queue, saved presets and drag and drop.
+- Frame sampling: save the first frame and every Nth source frame while preserving global source numbering.
+- Output size, scale and automatic/manual pixel aspect, including conversion to square pixels.
+- OCIO color management: bundled Nuke-style config or a custom config, including ACES.
+- Source/external audio, audio-only export and adding audio to MP4 without re-encoding video.
+- Media information, metadata and opening the output folder after conversion.
 
-## Supported Input Files
+## Rust player
 
-Video:
+**Playback control, frame selection, timing and seeking run in a standalone Rust engine.** FFmpeg decodes the media; Python/Qt displays the frames and handles the interface and audio. The converter and export pipeline remain Python + FFmpeg.
 
-`mov, mp4, mkv, ts, mxf, m4v, avi, webm`
+The player supports video timestamps (including VFR), image sequences with their source numbering, frame stepping and color transforms on pause and during playback. Timeline dragging uses a bounded preview cache; releasing the slider selects the exact final position and restores play/pause state.
 
-Images and image sequences:
+Preview uses an 8-bit RGBA display buffer sized for the viewport. This does not reduce export precision or change source media. GPU decoding and individual channel views are not implemented; long or uncached backward seeks can take time.
 
-`exr, dpx, png, jpg, jpeg, tga, targa, tif, tiff, gif`
+A native player build is required for each OS/CPU. Install Rust/Cargo using [rustup](https://rustup.rs/) and native linker/build tools (MSVC Build Tools on Windows; Apple Command Line Tools on macOS). The pinned toolchain is in `rust/player/rust-toolchain.toml`.
 
-Audio:
+Launchers build the player when Cargo is available and reuse a current compatible binary. To build explicitly in the prepared environment:
 
-`wav, mp3, aac, m4a, flac, ogg`
-
-## Supported Output Formats
-
-Image sequences / images:
-
-`EXR, DPX, PNG, JPG, TARGA, GIF`
-
-Video:
-
-`MOV, MP4`
-
-Planned video output containers:
-
-`MKV, WEBM, MXF, AVI`
-
-These planned containers still need separate codec, audio, metadata, and validation rules before they are enabled in the UI.
-
-Audio:
-
-`WAV, MP3, AAC`
-
-## Codecs and Settings
-
-MP4:
-
-`H.264, H.265, H.264 NVENC, H.265 NVENC`
-
-MOV:
-
-`ProRes`
-
-EXR:
-
-`16-bit half float by default, compression: none, zip1, zip16, rle`
-
-PNG:
-
-`RGB 8-bit, RGBA 8-bit, RGB 16-bit, RGBA 16-bit`
-
-JPG:
-
-`Quality slider 0-100`
-
-GIF:
-
-`Optimized palette, Sierra dithering, Bayer dithering, No dithering`
-
-Audio:
-
-`WAV 16-bit: 48 kHz, 44.1 kHz, 24 kHz, 14 kHz, 8 kHz; MP3: up to 256 kb/s; AAC: up to 256 kb/s`
-
-## Image Geometry and Pixel Aspect
-
-The Image block controls scale, output size, pixel aspect, and pixel-aspect output behavior.
-
-- `Scale` changes output size proportionally.
-- `Output Size` can be edited directly; width and height keep the source aspect ratio.
-- `Pixel Aspect: Auto` reads source pixel aspect when available, including EXR `pixelAspectRatio`.
-- `Pixel Aspect: Manual` lets you enter PAR manually when metadata is missing or wrong.
-- `Manual PAR` is disabled in Auto mode but still shows the detected value.
-- `Pixel Aspect Output: Keep Original Pixels` keeps the raster size and preserves non-square pixel intent.
-- `Pixel Aspect Output: Resize to Square Pixels` stretches the image to square pixels, useful for anamorphic sources.
-
-Example: a `2880 x 2160` EXR sequence with PAR `2.0` previews as `5760 x 2160` display aspect.
-
-## Audio Workflow
-
-The converter can work with source audio, external audio, or audio-only outputs.
-
-- `Audio Input` lets you add an external audio file.
-- Dragging one audio file into the app fills `Audio Input`.
-- Supported audio input: `wav, mp3, aac, m4a, flac, ogg`.
-- Supported audio output: `WAV, MP3, AAC`.
-- Video files with embedded audio can use `Copy Source Audio`, `AAC`, `MP3`, or `WAV`.
-- For MP4 with external audio, `Add Audio Without Re-encoding Video` copies the video stream and only encodes/muxes the audio.
-- In that mode, resize, pixel aspect, FPS, and color-transform controls are disabled because the video is not re-encoded.
-
-## Color Management
-
-The application supports separate input and output color transforms.
-
-Basic transforms:
-
-```text
-None
-sRGB
-Linear
-Rec.709
+```bash
+# Linux / macOS
+.venv/bin/python -m seventh_convert.build_player
 ```
 
-Color-management modes:
-
-```text
-None
-Nuke Default OCIO
-Custom OCIO config
-ACES through a custom OCIO config
+```powershell
+# Windows
+.venv\Scripts\python.exe -m seventh_convert.build_player
 ```
 
-In `None` mode, color management is disabled. Input and Output Transform controls are hidden, and the converter does not apply an OCIO LUT, an FFmpeg color transform, or forced output color metadata.
+The executable is installed in `seventh_convert/bin/`. Cargo is not needed to run an existing compatible build. If neither a compatible binary nor Cargo is available, the launcher reports use of Qt preview. A Cargo build failure stops startup and shows diagnostics.
 
-In Nuke mode, the application uses the bundled Nuke-style OCIO config.
+## Install and run
 
-In OCIO mode, you can select your own `config.ocio`, for example an ACES config installed on the machine.
+Requirements: **Python 3.11+**, **FFmpeg and ffprobe** on `PATH`. `uv` is optional; launchers create a local `.venv` using `uv` or Python's `venv`/`pip`. Do not copy a virtual environment between computers.
 
-## Presets
+Get the sources once:
 
-The application supports saving and loading user presets.
-
-A preset stores converter settings:
-
-```text
-Input
-Audio Input
-Output
-File Type
-Codec
-Codec Profile / Compression
-FPS
-In / Out
-Scale
-Output Size
-Pixel Aspect
-Color Management
-Input Transform
-Output Transform
-Audio settings
-Overwrite mode
-Add Audio Without Re-encoding Video mode
+```bash
+git clone https://github.com/Slavich86/7th-convert.git
+cd 7th-convert
 ```
 
-User presets are stored locally:
+### Linux
 
-```text
-~/.config/7th_VFX_convertor/presets/
+Install FFmpeg through your distribution's package manager, then run:
+
+```bash
+chmod +x 7th-vfx-convertor.sh
+./7th-vfx-convertor.sh
 ```
+
+The optional `.desktop` launcher must stay beside the `.sh` file.
+
+### Windows
+
+Install Python 3.11+ and run:
+
+```powershell
+.\7th-vfx-convertor.bat
+```
+
+If FFmpeg is missing, the launcher offers the included `install-ffmpeg.bat`, which uses `winget`. Keep `install-ffmpeg.ps1` beside it. After installation, reopen the terminal so the updated `PATH` is available.
+
+### macOS
+
+With [Homebrew](https://docs.brew.sh/Installation) installed:
+
+```bash
+brew install python@3.13 uv ffmpeg
+chmod +x 7th-vfx-convertor.command 7th-vfx-convertor.sh
+./7th-vfx-convertor.command
+```
+
+You can also double-click `.command` in Finder; keep it beside `.sh`. The launcher includes Homebrew paths for Apple Silicon and Intel. To build the native Rust player, install Cargo and Apple Command Line Tools (`xcode-select --install`). A signed/notarized `.app` is not included.
+
+**Platform verification:** playback and integration checks have run on Linux. Windows and macOS launchers are included, but installation and playback on actual Windows/macOS machines still need verification.
+
+Launchers resolve paths relative to their own folder, including paths containing spaces. Direct UI startup in an already prepared environment is also available: `.venv/bin/python -m seventh_convert.ui` (Windows: `.venv\Scripts\python.exe -m seventh_convert.ui`).
+
+`Help → Check for Updates` requires a Git clone. ZIP downloads and copied `publish/` contents have no `.git` directory and cannot self-update this way.
+
+## Formats
+
+| Media | Input | Output |
+|---|---|---|
+| Video | MOV, MP4, MKV, TS, MXF, M4V, AVI, WEBM | MOV (ProRes), MP4 (H.264 / H.265, including NVENC) |
+| Images / sequences | EXR, DPX, PNG, JPG/JPEG, TGA/TARGA, TIF/TIFF, GIF | EXR, DPX, PNG, JPG, TARGA, GIF |
+| Audio | WAV, MP3, AAC, M4A, FLAC, OGG | WAV, MP3, AAC |
+
+Actual codec availability depends on the installed FFmpeg build and hardware. EXR defaults to half float with selectable compression; PNG supports RGB/RGBA at 8 or 16 bits. JPG quality and GIF palette/dithering are configurable.
+
+## Color, geometry and audio
+
+Input and output transforms are separate. `Color Management: None` applies no OCIO LUT, FFmpeg color transform or forced output color metadata. Choose the bundled `Nuke Default OCIO` config or your own `config.ocio` for managed workflows, including ACES.
+
+Pixel aspect can be detected automatically (including EXR metadata) or set manually. `Keep Original Pixels` preserves the raster; `Resize to Square Pixels` adjusts it for square-pixel delivery. For example, a 2880 × 2160 source with PAR 2.0 displays at 5760 × 2160.
+
+Use embedded audio or `Audio Input` for an external file. `Add Audio Without Re-encoding Video` copies the MP4 video stream and encodes/muxes audio; resize, FPS and color controls are disabled in that mode.
+
+Presets store conversion, range, geometry, color and audio settings locally. Overwriting output requires the explicit overwrite option; source media must not be overwritten.
 
 ## Hotkeys
 
-Hotkeys work in the player area, preview placeholder, Play button, and timeline slider.
+Active in the player area, preview placeholder, Play button and timeline; typing in In/Out fields is preserved.
 
-They do not override typing inside the In / Out text fields.
+| Key | Action |
+|---|---|
+| Left / Right | Back / forward one frame |
+| Down / Up | Back / forward ten frames |
+| I / O | Set In / Out marker |
 
-```text
-Left Arrow  - step backward 1 frame
-Right Arrow - step forward 1 frame
-Up Arrow    - step forward 10 frames
-Down Arrow  - step backward 10 frames
-I           - set In marker
-O           - set Out marker
+## Clean distribution
+
+`publish/` is a generated folder for transferring the ready converter. From a prepared development environment, build and verify it with:
+
+```bash
+.venv/bin/python scripts/prepare_publish.py
+.venv/bin/python scripts/prepare_publish.py --check
 ```
+
+On Windows, use `.venv\Scripts\python.exe` for both commands.
+
+The explicit file list includes runtime Python code, presets, OCIO/LUT resources, icons, launchers, FFmpeg installer, user documentation, minimal Rust sources and a release player for the build machine's OS/CPU. Tests, old logs, benchmarks, caches, Cargo build output and `.venv` are excluded. Detailed player tracing is off by default.
+
+Copy the **contents** of `publish/` to the destination folder and run its launcher. Dependencies are installed in a new local `.venv`; FFmpeg/ffprobe are still required. For another OS/CPU, build the native player there from the included Rust sources. `publish/` is generated locally and is not committed to the development repository. Regenerating it replaces its contents; make changes in the development sources first.
 
 ## Donate
 
-Support converter development:
-
-```text
-PayPal: sl.oxuta@gmail.com
-```
-
-## Status
-
-This is a working prototype under active development. UI, presets, backend contract, and parts of the behavior may still change.
+Support development via PayPal: `sl.oxuta@gmail.com`.

@@ -1,0 +1,9 @@
+{
+  "resumed_frames": 127,
+  "resumed_fps": 25.000443122934932,
+  "resumed_contiguous_25fps": true,
+  "resumed_interval_ms_max": 42.5104719997762,
+  "audio_resets_total": 2,
+  "audio_video_delta_ms_max": 24.0,
+  "error": ""
+}

@@ -36,3 +36,10 @@ ref/
 plans/
 icon/
 backups/
+
+# Platform-specific preview build
+seventh_convert/bin/
+
+# Generated clean distribution (recreated by scripts/prepare_publish.py)
+/publish/
+/.publish-*/

@@ -4,112 +4,62 @@ set -u
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$APP_DIR" || exit 1
 
-missing=0
-APP_PYTHON="python3"
+# Finder does not necessarily inherit the shell's Homebrew/Cargo/uv PATH.
+if [ "$(uname -s)" = Darwin ]; then
+  if [ "$(uname -m)" = arm64 ]; then
+    export PATH="/opt/homebrew/bin:$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
+  else
+    export PATH="/usr/local/bin:$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
+  fi
+fi
+
 VENV_DIR="$APP_DIR/.venv"
-VENV_PYTHON="$VENV_DIR/bin/python"
+APP_PYTHON="$VENV_DIR/bin/python"
 REQUIREMENTS_FILE="$APP_DIR/requirements.txt"
 REQUIREMENTS_MARKER="$VENV_DIR/.requirements.sha256"
 
-require_command() {
-  if ! command -v "$1" >/dev/null 2>&1; then
-    printf 'Missing required command: %s\n' "$1" >&2
-    missing=1
+for tool in ffmpeg ffprobe; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    printf 'Missing required command: %s\n' "$tool" >&2
+    printf 'macOS: brew install ffmpeg\nLinux: install ffmpeg using your package manager.\n' >&2
+    exit 1
   fi
-}
+done
 
-require_python_module() {
-  if ! "$APP_PYTHON" - "$1" >/dev/null 2>&1 <<'PY'
-import importlib
-import sys
-
-importlib.import_module(sys.argv[1])
-PY
-  then
-    printf 'Missing required Python module: %s\n' "$1" >&2
-    missing=1
-  fi
-}
-
-requirements_hash() {
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$REQUIREMENTS_FILE" | awk '{print $1}'
-    return
-  fi
-
-  python3 - "$REQUIREMENTS_FILE" <<'PY'
-import hashlib
-import sys
-
-with open(sys.argv[1], "rb") as handle:
-    print(hashlib.sha256(handle.read()).hexdigest())
-PY
-}
-
-ensure_uv_venv() {
-  if ! command -v uv >/dev/null 2>&1; then
-    return 1
-  fi
-
-  if [ ! -x "$VENV_PYTHON" ]; then
-    printf 'Creating Python virtual environment with uv: %s\n' "$VENV_DIR"
-    uv venv "$VENV_DIR" --python python3 || return 1
-  fi
-
-  expected_hash="$(requirements_hash)"
-  current_hash=""
-  if [ -f "$REQUIREMENTS_MARKER" ]; then
-    current_hash="$(cat "$REQUIREMENTS_MARKER")"
-  fi
-
-  if [ "$expected_hash" != "$current_hash" ]; then
-    printf 'Installing Python dependencies into %s with uv pip-compatible installer\n' "$VENV_DIR"
-    uv pip install --python "$VENV_PYTHON" --link-mode=copy -r "$REQUIREMENTS_FILE" || return 1
-    printf '%s\n' "$expected_hash" > "$REQUIREMENTS_MARKER"
-  fi
-
-  APP_PYTHON="$VENV_PYTHON"
-  return 0
-}
-
-require_command python3
-require_command ffmpeg
-require_command ffprobe
-
-if [ "$missing" -eq 0 ]; then
-  if ! ensure_uv_venv; then
-    printf 'uv is not available or failed to prepare .venv; falling back to system python3.\n' >&2
-    APP_PYTHON="python3"
+if [ ! -x "$APP_PYTHON" ]; then
+  if command -v uv >/dev/null 2>&1; then
+    uv venv "$VENV_DIR" --python '>=3.11' || exit $?
+  else
+    if ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))'; then
+      printf 'Python 3.11+ is required. macOS: brew install python@3.13 uv\n' >&2
+      exit 1
+    fi
+    python3 -m venv "$VENV_DIR" || exit $?
+    "$APP_PYTHON" -m pip install -r "$REQUIREMENTS_FILE" || exit $?
   fi
 fi
 
-if command -v "$APP_PYTHON" >/dev/null 2>&1 || [ -x "$APP_PYTHON" ]; then
-  require_python_module numpy
-  require_python_module PySide6
-  require_python_module PyOpenColorIO
-  require_python_module OpenEXR
-fi
-
-if [ "$missing" -ne 0 ]; then
-  message='Install system dependencies first:
-  Fedora: sudo dnf install ffmpeg-free
-  Ubuntu/Debian: sudo apt update && sudo apt install ffmpeg
-  Arch/Manjaro: sudo pacman -S ffmpeg
-
-Install Python dependencies:
-  curl -LsSf https://astral.sh/uv/install.sh | sh
-  ./7th-vfx-convertor.sh
-
-Fallback without uv:
-  python3 -m pip install -r requirements.txt'
-
-  printf '\n%s\n\n' "$message" >&2
-
-  if command -v notify-send >/dev/null 2>&1; then
-    notify-send "7th VFX convertor dependencies missing" "$message"
-  fi
-
+if ! "$APP_PYTHON" -c 'import sys; sys.exit(sys.version_info < (3, 11))'; then
+  printf 'The local .venv requires Python 3.11+. Recreate it on this computer.\n' >&2
   exit 1
 fi
 
+if command -v uv >/dev/null 2>&1; then
+  expected_hash="$("$APP_PYTHON" -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$REQUIREMENTS_FILE")" || exit $?
+  current_hash=""
+  if [ -f "$REQUIREMENTS_MARKER" ]; then
+    current_hash="$(< "$REQUIREMENTS_MARKER")"
+  fi
+  if [ "$expected_hash" != "$current_hash" ]; then
+    uv pip install --python "$APP_PYTHON" --link-mode=copy -r "$REQUIREMENTS_FILE" || exit $?
+    printf '%s\n' "$expected_hash" > "$REQUIREMENTS_MARKER"
+  fi
+fi
+
+if ! "$APP_PYTHON" -c 'import numpy, PySide6, PyOpenColorIO, OpenEXR'; then
+  printf 'Dependencies are missing in %s. Install with:\n  "%s" -m pip install -r "%s"\n' "$VENV_DIR" "$APP_PYTHON" "$REQUIREMENTS_FILE" >&2
+  exit 1
+fi
+
+"$APP_PYTHON" -m seventh_convert.build_player --if-available || exit $?
 exec "$APP_PYTHON" -m seventh_convert.ui "$@"

@@ -1,0 +1,38 @@
+[
+  {
+    "variant": "early_auto_8",
+    "filter_threads": 8,
+    "frames": 50,
+    "wall_s": 1.1874938769997243,
+    "fps": 42.10548026262506,
+    "returncode": 0,
+    "stderr": ""
+  },
+  {
+    "variant": "early_float_8",
+    "filter_threads": 8,
+    "frames": 50,
+    "wall_s": 1.2238150749999477,
+    "fps": 40.85584580660778,
+    "returncode": 0,
+    "stderr": ""
+  },
+  {
+    "variant": "early_float_16",
+    "filter_threads": 16,
+    "frames": 50,
+    "wall_s": 1.2116959519999,
+    "fps": 41.26447721268291,
+    "returncode": 0,
+    "stderr": ""
+  },
+  {
+    "variant": "early_16bit_8",
+    "filter_threads": 8,
+    "frames": 50,
+    "wall_s": 1.2079130299998724,
+    "fps": 41.39370861824819,
+    "returncode": 0,
+    "stderr": ""
+  }
+]

@@ -1,0 +1,34 @@
+{
+  "file": "/mnt/ARCHIVE/PROJECT_ARCHIVE/BREVNO/SRC/ASSASSIU_S001_S001_T013.MOV",
+  "sound": false,
+  "qt_offscreen": true,
+  "filter": "lut3d=file='/tmp/7th-convert/ocio_luts/aba529e32ce5a0fe14e06e70616662cfa2f2d722.cube':interp=tetrahedral",
+  "display_bounds": [
+    684,
+    692
+  ],
+  "painted": 679,
+  "replaced_before_paint": 0,
+  "completed": true,
+  "expected_frames": 679,
+  "presented_frames": 679,
+  "timestamps_match_25fps": true,
+  "effective_fps": 24.996068370986432,
+  "wall_s": 27.12426570200023,
+  "media_s": 27.12,
+  "drift_ms": 4.265702000228799,
+  "first_frame_ms": 1098.3632729994497,
+  "interval_ms": {
+    "median": 40.254003999507404,
+    "p95": 41.02146200057177,
+    "max": 47.07881800004543
+  },
+  "intervals_over_60ms": 0,
+  "audio_decoded_buffers": 0,
+  "audio_decoded_s": 0.0,
+  "audio_state_samples": {},
+  "audio_video_position_delta_ms": null,
+  "audio_errors": [],
+  "errors": [],
+  "qt_error": ""
+}

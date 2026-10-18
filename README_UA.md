@@ -3,346 +3,149 @@
 </p>
 
 <p align="center">
-  <strong>Десктопний VFX media converter для Linux та Windows.</strong>
-</p>
-
-<p align="center">
+  <img src="https://img.shields.io/badge/Player-Rust-orange" alt="Rust player">
   <img src="https://img.shields.io/badge/Python-3.11%2B-blue" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/UI-Qt%206-green" alt="Qt 6">
-  <img src="https://img.shields.io/badge/Platform-Linux%20%2F%20Windows-lightgrey" alt="Linux / Windows">
-  <img src="https://img.shields.io/github/v/release/Slavich86/7th-convert?include_prereleases" alt="Release">
 </p>
 
-<p align="center">
-  <a href="#встановлення-системних-залежностей">Встановлення</a> &bull;
-  <a href="#запуск">Запуск</a> &bull;
-  <a href="#підтримувані-input-файли">Input формати</a> &bull;
-  <a href="#підтримувані-output-формати">Output формати</a> &bull;
-  <a href="#хоткеї">Хоткеї</a> &bull;
-  <a href="README.md">English</a>
-</p>
+# 7th VFX convertor
 
----
+Десктопний конвертор VFX-відео, послідовностей кадрів, зображень та аудіо з **плеєром на Rust**, інтерфейсом Python/PySide6 (Qt 6) і конвертацією через FFmpeg.
 
-**7th VFX convertor** - десктопний конвертор медіа для VFX-пайплайнів.
-
-Програма створена для конвертації відео, image sequence, окремих зображень та аудіо з контролем кольору, розміру, pixel aspect, In/Out range і пресетів.
-
-Поточна версія написана на Python з Qt 6 Widgets UI і використовує `ffmpeg` / `ffprobe` для аналізу та конвертації медіа.
+[English](README.md) · [Встановлення та запуск](#встановлення-та-запуск) · [Плеєр на Rust](#плеєр-на-rust) · [Формати](#формати) · [Чистий комплект](#чистий-комплект)
 
 ![Головне вікно 7th VFX convertor](docs/images/main-window.png)
 
-## Встановлення системних залежностей
+## Можливості
 
-`ffmpeg` і `ffprobe` мають бути встановлені в системі та доступні через `PATH`.
+- Відтворення відео й послідовностей кадрів, перемотування, покадрові переходи та маркери In/Out через Rust-плеєр.
+- Автоматичне визначення sequences, оригінальна нумерація кадрів і розбиття на діапазони за наявності пропусків.
+- Конвертація всього джерела або вибраного діапазону, черга завдань, збереження пресетів і перетягування файлів.
+- Вибірка кадрів: перший кадр та кожен N-й кадр зі збереженням глобальної нумерації джерела.
+- Розмір результату, масштаб, автоматичний/ручний pixel aspect і перерахунок у квадратні пікселі.
+- Керування кольором через OCIO: вбудований Nuke-style config або власна конфігурація, зокрема ACES.
+- Вбудований або зовнішній звук, окремий експорт аудіо та додавання звуку в MP4 без перекодування відео.
+- Інформація про медіа, метадані й відкриття теки результату після конвертації.
 
-Назва Linux-дистрибутива | Команда
---- | ---
-Fedora, офіційний free-build | `sudo dnf install ffmpeg-free`
-Fedora, RPM Fusion / full codecs | `sudo dnf install ffmpeg --allowerasing`
-Ubuntu | `sudo apt update && sudo apt install ffmpeg`
-Debian | `sudo apt update && sudo apt install ffmpeg`
-Linux Mint | `sudo apt update && sudo apt install ffmpeg`
-Pop!_OS | `sudo apt update && sudo apt install ffmpeg`
-Arch Linux | `sudo pacman -S ffmpeg`
-Manjaro | `sudo pacman -S ffmpeg`
-EndeavourOS | `sudo pacman -S ffmpeg`
-openSUSE Tumbleweed / Leap | `sudo zypper install ffmpeg`
-Alpine Linux | `sudo apk add ffmpeg`
+## Плеєр на Rust
 
-## Встановлення Python-залежностей
+**Керування відтворенням, вибір кадрів, таймінг і перемотування працюють в окремому ядрі на Rust.** FFmpeg декодує медіа, а Python/Qt показує кадри та відповідає за інтерфейс і звук. Конвертор та експорт залишаються на Python + FFmpeg.
 
-Потрібен Python 3.11+.
+Плеєр підтримує часові мітки відео, включно з VFR, послідовності з оригінальною нумерацією, покадрові переходи й колірні перетворення на паузі та під час відтворення. Перетягування таймлайна використовує обмежений кеш preview; відпускання повзунка встановлює точну кінцеву позицію та відновлює стан відтворення/паузи.
 
-Рекомендовано: встановити `uv`, після цього launcher сам створить `.venv` і поставить Python-залежності туди:
+Для показу використовується 8-бітний RGBA-буфер під розмір області preview. Це не знижує точність експорту й не змінює вихідне медіа. GPU-декодування та перегляд окремих каналів ще не реалізовані; переходи назад на довгих відео або до кадрів поза кешем можуть потребувати часу.
 
-Linux:
+Для кожної ОС/процесора потрібна нативна збірка плеєра. Встановіть Rust/Cargo через [rustup](https://rustup.rs/) та засоби компонування своєї ОС: MSVC Build Tools для Windows або Apple Command Line Tools для macOS. Toolchain зафіксований у `rust/player/rust-toolchain.toml`.
+
+Launchers збирають плеєр за наявності Cargo та повторно використовують актуальний сумісний бінарник. Явна збірка у підготовленому середовищі:
+
+```bash
+# Linux / macOS
+.venv/bin/python -m seventh_convert.build_player
+```
+
+```powershell
+# Windows
+.venv\Scripts\python.exe -m seventh_convert.build_player
+```
+
+Виконуваний файл встановлюється в `seventh_convert/bin/`. Для запуску готової сумісної збірки Cargo не потрібен. Якщо немає ні сумісного бінарника, ні Cargo, launcher повідомляє про використання Qt preview. Помилка збірки Cargo зупиняє запуск із діагностикою.
+
+## Встановлення та запуск
+
+Потрібні **Python 3.11+**, **FFmpeg і ffprobe** у `PATH`. `uv` необов'язковий: launchers створюють локальну `.venv` через `uv` або стандартні Python `venv`/`pip`. Не переносіть віртуальне середовище між комп'ютерами.
+
+Один раз завантажте джерела:
 
 ```bash
 git clone https://github.com/Slavich86/7th-convert.git
 cd 7th-convert
+```
+
+### Linux
+
+Встановіть FFmpeg через пакетний менеджер свого дистрибутива й запустіть:
+
+```bash
+chmod +x 7th-vfx-convertor.sh
 ./7th-vfx-convertor.sh
 ```
 
-Windows:
+Додатковий `.desktop` launcher має лежати поруч із `.sh`.
 
-```powershell
-git clone https://github.com/Slavich86/7th-convert.git
-cd 7th-convert
-.\7th-vfx-convertor.bat
-```
+### Windows
 
-Launcher перевіряє `python`, `ffmpeg`, `ffprobe` та `uv`. Якщо `ffmpeg` або `uv` відсутні на Windows — пропонує встановити їх автоматично через `winget`. На Linux встановіть `ffmpeg` через пакетний менеджер.
-
-> **Self-update** (`Help → Check for Updates`) працює тільки коли конвертер
-> встановлено через `git clone`. ZIP-архіви не містять `.git` теку, необхідну
-> для автоматичних оновлень.
-
-Launcher створює:
-
-```text
-.venv/
-```
-
-і встановлює залежності командою:
-
-```bash
-uv pip install --python .venv/bin/python --link-mode=copy -r requirements.txt
-```
-
-Fallback без `uv`:
-
-Linux:
-
-```bash
-python3 -m pip install -r requirements.txt
-```
-
-Windows:
-
-```powershell
-python -m pip install -r requirements.txt
-```
-
-## Запуск
-
-Рекомендований запуск з кореня репозиторію:
-
-Linux:
-
-```bash
-./7th-vfx-convertor.sh
-```
-
-Windows:
+Встановіть Python 3.11+ і запустіть:
 
 ```powershell
 .\7th-vfx-convertor.bat
 ```
 
-Launcher перевіряє потрібні системні інструменти та Python-модулі перед запуском UI.
-Якщо доступний `uv`, launcher автоматично готує локальну `.venv` і запускає UI через Python-інтерпретатор із `.venv`.
+Якщо FFmpeg відсутній, launcher запропонує включений `install-ffmpeg.bat`, який використовує `winget`. Тримайте `install-ffmpeg.ps1` поруч із ним. Після встановлення перевідкрийте термінал, щоб отримати оновлений `PATH`.
 
-Прямий запуск через Python теж доступний:
+### macOS
 
-Linux:
+За наявності [Homebrew](https://docs.brew.sh/Installation):
 
 ```bash
-.venv/bin/python -m seventh_convert.ui
+brew install python@3.13 uv ffmpeg
+chmod +x 7th-vfx-convertor.command 7th-vfx-convertor.sh
+./7th-vfx-convertor.command
 ```
 
-Windows:
+Також можна двічі натиснути `.command` у Finder; він має лежати поруч із `.sh`. Launcher враховує шляхи Homebrew для Apple Silicon та Intel. Для нативного Rust-плеєра встановіть Cargo й Apple Command Line Tools (`xcode-select --install`). Підписаного/notarized `.app` у комплекті немає.
 
-```powershell
-.venv\Scripts\python.exe -m seventh_convert.ui
+**Перевірка платформ:** відтворення та інтеграційні перевірки виконувалися на Linux. Launchers для Windows і macOS включені, проте встановлення та playback на справжніх Windows/macOS ще потребують перевірки.
+
+Launchers знаходять файли відносно власної теки, включно зі шляхами з пробілами. Прямий запуск у вже підготовленому середовищі: `.venv/bin/python -m seventh_convert.ui` (Windows: `.venv\Scripts\python.exe -m seventh_convert.ui`).
+
+`Help → Check for Updates` потребує Git-клону. ZIP-архіви та перенесений вміст `publish/` не мають `.git` і не можуть оновлюватися цим способом.
+
+## Формати
+
+| Медіа | Вхід | Вихід |
+|---|---|---|
+| Відео | MOV, MP4, MKV, TS, MXF, M4V, AVI, WEBM | MOV (ProRes), MP4 (H.264 / H.265, включно з NVENC) |
+| Зображення / sequences | EXR, DPX, PNG, JPG/JPEG, TGA/TARGA, TIF/TIFF, GIF | EXR, DPX, PNG, JPG, TARGA, GIF |
+| Аудіо | WAV, MP3, AAC, M4A, FLAC, OGG | WAV, MP3, AAC |
+
+Доступність кодеків залежить від збірки FFmpeg та обладнання. EXR за замовчуванням використовує half float із вибором компресії; PNG підтримує RGB/RGBA у 8 або 16 бітах. Якість JPG і палітра/дизеринг GIF налаштовуються.
+
+## Колір, геометрія та звук
+
+Вхідний і вихідний колірні трансформи задаються окремо. `Color Management: None` не застосовує OCIO LUT, колірні перетворення FFmpeg або примусові вихідні color metadata. Для керування кольором виберіть вбудований `Nuke Default OCIO` або власний `config.ocio`, зокрема ACES.
+
+Pixel aspect визначається автоматично, включно з EXR metadata, або задається вручну. `Keep Original Pixels` зберігає розмір растра; `Resize to Square Pixels` перераховує його для квадратних пікселів. Наприклад, джерело 2880 × 2160 із PAR 2.0 показується як 5760 × 2160.
+
+Використовуйте вбудований звук або додайте зовнішній файл через `Audio Input`. Режим `Add Audio Without Re-encoding Video` копіює MP4 video stream і кодує/додає аудіо; зміна розміру, FPS і кольору в цьому режимі вимкнена.
+
+Пресети локально зберігають налаштування конвертації, діапазону, геометрії, кольору та звуку. Перезапис результату потребує явного параметра overwrite; вихідне медіа не можна перезаписувати.
+
+## Хоткеї
+
+Працюють у зоні плеєра, preview placeholder, кнопці Play і таймлайні; введення в полях In/Out зберігається.
+
+| Клавіша | Дія |
+|---|---|
+| Left / Right | Назад / уперед на один кадр |
+| Down / Up | Назад / уперед на десять кадрів |
+| I / O | Встановити маркер In / Out |
+
+## Чистий комплект
+
+`publish/` — згенерована тека для перенесення готового конвертора. У підготовленому середовищі розробки створіть і перевірте її:
+
+```bash
+.venv/bin/python scripts/prepare_publish.py
+.venv/bin/python scripts/prepare_publish.py --check
 ```
 
-## Desktop Launcher
+На Windows використовуйте `.venv\Scripts\python.exe` для обох команд.
 
-У репозиторії є:
+За явним списком включаються робочий Python-код, пресети, OCIO/LUT, іконки, launchers, FFmpeg installer, користувацька документація, мінімальні Rust-джерела та release-плеєр для ОС/процесора машини збірки. Тести, старі логи, benchmarks, кеші, Cargo build output і `.venv` не входять до комплекту. Детальне трасування плеєра за замовчуванням вимкнене.
 
-```text
-7th-vfx-convertor.bat
-7th-vfx-convertor.desktop
-7th-vfx-convertor.sh
-```
+Перенесіть **вміст** `publish/` у цільову теку й запустіть launcher. Залежності встановлюються в нову локальну `.venv`; FFmpeg/ffprobe потрібні окремо. Для іншої ОС/процесора зберіть нативний плеєр там із включених Rust-джерел. `publish/` генерується локально й не комітиться в репозиторій розробки. Повторна генерація замінює його вміст: зміни спочатку робіть у джерелах.
 
-`.desktop` файл потрібен для Linux і очікує, що `7th-vfx-convertor.sh` лежить у тій самій теці. Якщо файловий менеджер блокує запуск desktop-файлів, зроби обидва файли executable або запускай shell launcher напряму. На Windows використовуй `7th-vfx-convertor.bat`.
+## Підтримати розробку
 
-## Що вміє програма
-
-- Відкривати відеофайли, зображення, image sequence та аудіо.
-- Автоматично знаходити image sequence.
-- Розбивати sequence на окремі частини, якщо є пропущені кадри.
-- Показувати preview у плеєрі.
-- Показувати поточний кадр.
-- Ставити In / Out markers.
-- Конвертувати весь файл або тільки вибраний range.
-- Для video → image sequence зберігати перший кадр і кожен N-й кадр з глобальними номерами source кадрів, наприклад `0001`, `0005`, `0010` для `Frame Step = 5`.
-- Конвертувати через чергу jobs.
-- Зберігати і завантажувати user presets.
-- Запам'ятовувати останні папки для відео/image input, audio input та presets.
-- Показувати Media Info і Metadata.
-- Перетягувати файли через Drag and Drop.
-- Відкривати output folder після конвертації.
-- Перевіряти та автоматично оновлювати конвертер з GitHub.
-- Автоматично встановлювати залежності (ffmpeg, uv) на Windows через winget.
-- Preview proxy для кодеків без нативної підтримки Qt (напр. ProRes на Windows).
-- EXR preview через OpenEXR, коли Qt image plugin недоступний.
-
-## Підтримувані input файли
-
-Відео:
-
-`mov, mp4, mkv, ts, mxf, m4v, avi, webm`
-
-Зображення та image sequence:
-
-`exr, dpx, png, jpg, jpeg, tga, targa, tif, tiff, gif`
-
-Аудіо:
-
-`wav, mp3, aac, m4a, flac, ogg`
-
-## Підтримувані output формати
-
-Image sequence / images:
-
-`EXR, DPX, PNG, JPG, TARGA, GIF`
-
-Video:
-
-`MOV, MP4`
-
-Заплановані video output контейнери:
-
-`MKV, WEBM, MXF, AVI`
-
-Для цих контейнерів ще треба окремо налаштувати codec, audio, metadata та validation rules перед тим, як вмикати їх у UI.
-
-Audio:
-
-`WAV, MP3, AAC`
-
-## Кодеки та налаштування
-
-MP4:
-
-`H.264, H.265, H.264 NVENC, H.265 NVENC`
-
-MOV:
-
-`ProRes`
-
-EXR:
-
-`16-bit half float за замовчуванням, compression: none, zip1, zip16, rle`
-
-PNG:
-
-`RGB 8-bit, RGBA 8-bit, RGB 16-bit, RGBA 16-bit`
-
-JPG:
-
-`Quality slider 0-100`
-
-GIF:
-
-`Optimized palette, Sierra dithering, Bayer dithering, No dithering`
-
-Audio:
-
-`WAV 16-bit: 48 kHz, 44.1 kHz, 24 kHz, 14 kHz, 8 kHz; MP3: до 256 kb/s; AAC: до 256 kb/s`
-
-## Image Geometry та Pixel Aspect
-
-Блок Image керує scale, output size, pixel aspect та тим, як записувати non-square pixels.
-
-- `Scale` пропорційно змінює output size.
-- `Output Size` можна редагувати напряму; width і height зберігають співвідношення сторін source.
-- `Pixel Aspect: Auto` читає pixel aspect з metadata, якщо він є, включно з EXR `pixelAspectRatio`.
-- `Pixel Aspect: Manual` дозволяє ввести PAR вручну, якщо metadata немає або вона неправильна.
-- `Manual PAR` у режимі Auto disabled, але показує знайдене значення.
-- `Pixel Aspect Output: Keep Original Pixels` зберігає raster size і non-square pixel intent.
-- `Pixel Aspect Output: Resize to Square Pixels` розтягує зображення до square pixels, що потрібно для анаморфних source.
-
-Приклад: EXR sequence `2880 x 2160` з PAR `2.0` у preview виглядає як `5760 x 2160` display aspect.
-
-## Робота зі звуком
-
-Конвертор може працювати із source audio, external audio або audio-only output.
-
-- `Audio Input` дозволяє додати окремий audio file.
-- Drag and Drop одного audio file заповнює `Audio Input`.
-- Підтримуваний audio input: `wav, mp3, aac, m4a, flac, ogg`.
-- Підтримуваний audio output: `WAV, MP3, AAC`.
-- Video files з embedded audio можуть використовувати `Copy Source Audio`, `AAC`, `MP3` або `WAV`.
-- Для MP4 з external audio режим `Add Audio Without Re-encoding Video` копіює video stream і тільки кодує/додає audio.
-- У цьому режимі resize, pixel aspect, FPS і color-transform controls disabled, бо video не перекодовується.
-
-## Color Management
-
-Програма підтримує color transform для input і output окремо.
-
-Базові трансформи:
-
-```text
-None
-sRGB
-Linear
-Rec.709
-```
-
-Режими Color Management:
-
-```text
-None
-Nuke Default OCIO
-Custom OCIO config
-ACES через custom OCIO config
-```
-
-У режимі `None` керування кольором вимкнене. Поля Input Transform та Output Transform приховані, а конвертор не застосовує OCIO LUT, FFmpeg color transform або примусові output color metadata.
-
-У режимі Nuke використовується вбудований Nuke-style OCIO config.
-
-У режимі OCIO можна вибрати свій `config.ocio`, наприклад ACES config, якщо він встановлений на машині.
-
-## Presets
-
-Програма підтримує збереження і завантаження user presets.
-
-Preset зберігає налаштування конвертора:
-
-```text
-Input
-Audio Input
-Output
-File Type
-Codec
-Codec Profile / Compression
-FPS
-In / Out
-Scale
-Output Size
-Pixel Aspect
-Color Management
-Input Transform
-Output Transform
-Audio settings
-Overwrite mode
-Add Audio Without Re-encoding Video mode
-```
-
-User presets зберігаються локально:
-
-```text
-~/.config/7th_VFX_convertor/presets/
-```
-
-## Hotkeys
-
-Хоткеї працюють у зоні плеєра, preview placeholder, Play button і timeline slider.
-
-Вони не перехоплюються, коли користувач вводить текст у поля In / Out.
-
-```text
-Left Arrow  - назад на 1 кадр
-Right Arrow - вперед на 1 кадр
-Up Arrow    - вперед на 10 кадрів
-Down Arrow  - назад на 10 кадрів
-I           - поставити In marker
-O           - поставити Out marker
-```
-
-## Donate
-
-Підтримати розвиток конвертора:
-
-```text
-PayPal: sl.oxuta@gmail.com
-```
-
-## Статус
-
-Це робочий прототип у активній розробці. UI, presets, backend contract і частина поведінки ще можуть змінюватися.
+PayPal: `sl.oxuta@gmail.com`.

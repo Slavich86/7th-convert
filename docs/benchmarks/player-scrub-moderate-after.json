@@ -1,0 +1,11 @@
+{
+  "completed": true,
+  "moves": 150,
+  "frames_during_drag": 97,
+  "frames_total": 98,
+  "final_target_ms": 6500,
+  "final_pts_us": 6520000,
+  "release_to_final_ms": 632.3559459997341,
+  "first_drag_frame_ms": 697.634776999621,
+  "error": ""
+}

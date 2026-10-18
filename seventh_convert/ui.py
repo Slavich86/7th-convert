@@ -60,6 +60,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .preview_controller import PreviewController
 from .command_builder import ConvertJob, build_ffmpeg_args, build_preview_frame_args, build_preview_proxy_args
 from .converter import format_command, output_exists_for_job, same_input_and_output, validate_job
 from .exr_metadata import preserve_exr_metadata_for_job
@@ -692,10 +693,23 @@ class TimelineSlider(QSlider):
 
 
 class PreviewLabel(QLabel):
+    framePainted = Signal(object)
+
     def __init__(self, text: str = "", parent: QWidget | None = None) -> None:
         super().__init__(text, parent)
         self._source_pixmap = QPixmap()
         self._source_pixel_aspect = 1.0
+        self.player_frame_token = None
+        self._painted_frame_token = None
+
+    def paintEvent(self, event) -> None:
+        started_ns = time.perf_counter_ns()
+        super().paintEvent(event)
+        token = self.player_frame_token
+        if token is not None and token is not self._painted_frame_token:
+            self._painted_frame_token = token
+            token["paint_ms"] = (time.perf_counter_ns() - started_ns) / 1e6
+            self.framePainted.emit(token)
 
     def set_source_pixmap(self, pixmap: QPixmap, pixel_aspect: float = 1.0) -> None:
         self._source_pixmap = QPixmap(pixmap)
@@ -1513,6 +1527,21 @@ class MainWindow(QMainWindow):
         self._build_queue_tab()
         self._build_logs_tab()
         self._build_menu()
+        self.rust_preview = PreviewController(self)
+        self.fps_edit.editingFinished.connect(self.rust_preview.refresh)
+        if not self.rust_preview.available:
+            self.append_log("Rust preview is not built; using Qt preview. Build with: python -m seventh_convert.build_player")
+
+    def closeEvent(self, event) -> None:
+        self.rust_preview.shutdown()
+        self.sequence_timer.stop()
+        self.preview_frame_render_timer.stop()
+        if self.preview_frame_worker is not None:
+            self.preview_frame_worker.cancel()
+            self.preview_frame_worker.wait(3000)
+        if self.player:
+            self.player.stop()
+        super().closeEvent(event)
 
     def _build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
@@ -2042,16 +2071,27 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.preview_container, stretch=1)
 
         controls = QHBoxLayout()
-        self.play_button = QPushButton("Play")
+        self.play_button = QPushButton()
+        self.play_button.setFixedWidth(36)
+        self.play_button.setIconSize(QSize(20, 20))
+        self.update_playback_button(False)
         self.play_button.clicked.connect(self.toggle_playback)
+        self.stop_button = QPushButton()
+        self.stop_button.setFixedWidth(36)
+        self.stop_button.setIconSize(QSize(20, 20))
+        self.stop_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaStop))
+        self.stop_button.setToolTip("Stop")
+        self.stop_button.setAccessibleName("Stop")
+        self.stop_button.clicked.connect(self.stop_playback)
         self.position_slider = TimelineSlider(Qt.Orientation.Horizontal)
-        self.play_button.setEnabled(False)
+        self.set_playback_controls_enabled(False)
         self.position_slider.setEnabled(False)
         self.position_slider.sliderMoved.connect(self.seek_preview_position)
         self.position_slider.set_marker_value_mapper(self._ms_to_slider_value)
         self.current_frame_label = QLabel("Frame: -")
         self.current_frame_label.setMinimumWidth(92)
         controls.addWidget(self.play_button)
+        controls.addWidget(self.stop_button)
         controls.addWidget(self.position_slider, stretch=1)
         controls.addWidget(self.current_frame_label)
         layout.addLayout(controls)
@@ -2082,7 +2122,7 @@ class MainWindow(QMainWindow):
         range_row.addWidget(self.set_out_button)
         range_row.addWidget(self.clear_range_button)
         layout.addLayout(range_row)
-        for widget in (panel, self.preview_container, self.preview_placeholder, self.play_button, self.position_slider):
+        for widget in (panel, self.preview_container, self.preview_placeholder, self.play_button, self.stop_button, self.position_slider):
             widget.installEventFilter(self)
         return panel
 
@@ -2580,6 +2620,7 @@ class MainWindow(QMainWindow):
         self.tabs.setCurrentIndex(0)
 
     def disable_unsupported_video_preview(self) -> None:
+        self.rust_preview.stop()
         if self.player:
             self.player.stop()
             self.player.setSource(QUrl())
@@ -2592,8 +2633,8 @@ class MainWindow(QMainWindow):
         self._last_video_source_pixmap = QPixmap()
         self.sequence_timer.stop()
         self.position_slider.setEnabled(False)
-        self.play_button.setEnabled(False)
-        self.play_button.setText("Play")
+        self.set_playback_controls_enabled(False)
+        self.update_playback_button(False)
         self.preview_placeholder.clear()
         self.preview_placeholder.setText(self.current_input_unsupported_reason or "Unsupported video")
         self.preview_placeholder.show()
@@ -3781,6 +3822,7 @@ class MainWindow(QMainWindow):
         self.log_text.appendPlainText(line)
 
     def _prepare_preview_source(self, path: Path, is_sequence: bool = False) -> None:
+        self.rust_preview.stop()
         self.sequence_timer.stop()
         self.sequence_preview_frames = []
         self.sequence_frame_index = 0
@@ -3801,7 +3843,7 @@ class MainWindow(QMainWindow):
         self.position_slider.setMaximum(0)
         self.position_slider.clear_markers()
         self.update_current_frame_label()
-        self.play_button.setText("Play")
+        self.update_playback_button(False)
 
         if self.player:
             self.player.stop()
@@ -3826,20 +3868,35 @@ class MainWindow(QMainWindow):
         if self.preview_layout.indexOf(self.preview_placeholder) == -1:
             self.preview_layout.addWidget(self.preview_placeholder)
 
+        if self.rust_preview.available and self.use_media:
+            if is_sequence:
+                self.sequence_preview_frames = sequence_frames(Path(self.input_edit.text()).expanduser())
+                start, end = self.current_input_sequence_start, self.current_input_sequence_end
+                if start is not None and end is not None:
+                    self.sequence_preview_frames = [frame for frame in self.sequence_preview_frames
+                                                    if start <= (_frame_number_from_path(frame) or 0) <= end]
+            elif _is_still_image_path(path):
+                self.sequence_preview_frames = [path]
+            self.position_slider.setMaximum(max(len(self.sequence_preview_frames) - 1, 0))
+            self.position_slider.setEnabled(is_sequence or not self.sequence_preview_frames)
+            self.set_playback_controls_enabled(not self.sequence_preview_frames or len(self.sequence_preview_frames) > 1)
+            self.rust_preview.open()
+            return
+
         if is_sequence:
             self.sequence_preview_frames = sequence_frames(Path(self.input_edit.text()).expanduser())
             if not self.sequence_preview_frames:
                 self.sequence_preview_frames = [path] if path.exists() else []
             self.position_slider.setMaximum(max(len(self.sequence_preview_frames) - 1, 0))
             self.position_slider.setEnabled(len(self.sequence_preview_frames) > 1)
-            self.play_button.setEnabled(len(self.sequence_preview_frames) > 1)
+            self.set_playback_controls_enabled(len(self.sequence_preview_frames) > 1)
             self.show_sequence_frame(0)
             return
 
         if _is_still_image_path(path):
             self.sequence_preview_frames = [path] if path.exists() else []
             self.position_slider.setEnabled(False)
-            self.play_button.setEnabled(False)
+            self.set_playback_controls_enabled(False)
             self.show_sequence_frame(0)
             return
 
@@ -3847,10 +3904,10 @@ class MainWindow(QMainWindow):
             self.preview_placeholder.setText("Preview disabled in offscreen mode")
             return
 
-        self.play_button.setEnabled(True)
+        self.set_playback_controls_enabled(True)
         if self.color_preview_is_active():
             self.preview_is_color_managed = True
-            self.play_button.setEnabled(True)
+            self.set_playback_controls_enabled(True)
             self.position_slider.setEnabled(True)
             self.render_video_frame()
             return
@@ -3904,7 +3961,41 @@ class MainWindow(QMainWindow):
         self.position_slider.setValue(position_ms)
         self.update_current_frame_label()
 
+    def update_playback_button(self, playing: bool) -> None:
+        action = "Pause" if playing else "Play"
+        icon = QStyle.StandardPixmap.SP_MediaPause if playing else QStyle.StandardPixmap.SP_MediaPlay
+        self.play_button.setIcon(self.style().standardIcon(icon))
+        self.play_button.setToolTip(action)
+        self.play_button.setAccessibleName(action)
+
+    def set_playback_controls_enabled(self, enabled: bool) -> None:
+        self.play_button.setEnabled(enabled)
+        self.stop_button.setEnabled(enabled)
+
+    def stop_playback(self) -> None:
+        if hasattr(self, "rust_preview") and self.rust_preview.active:
+            self.rust_preview.stop_playback()
+            self.position_slider.setSliderDown(False)
+            return
+        self.sequence_timer.stop()
+        self.preview_frame_render_timer.stop()
+        self.preview_is_raw_playback = False
+        if self.player:
+            self.player.stop()
+            self.player.setPosition(0)
+        self.update_playback_button(False)
+        if self.sequence_preview_frames:
+            self.show_sequence_frame(0)
+        else:
+            self.position_slider.setValue(0)
+            self.update_current_frame_label()
+            if self.preview_is_color_managed:
+                self.render_video_frame()
+
     def toggle_playback(self) -> None:
+        if hasattr(self, "rust_preview") and self.rust_preview.active:
+            self.rust_preview.toggle()
+            return
         if self.preview_is_sequence:
             if not self.preview_is_raw_playback:
                 self.preview_is_raw_playback = True
@@ -3922,13 +4013,13 @@ class MainWindow(QMainWindow):
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.player.pause()
             self.preview_is_raw_playback = False
-            self.play_button.setText("Play")
+            self.update_playback_button(False)
             if self.preview_is_color_managed:
                 self.render_video_frame()
         else:
             self.preview_is_raw_playback = True
             self.player.play()
-            self.play_button.setText("Pause")
+            self.update_playback_button(True)
 
     def toggle_sequence_playback(self) -> None:
         if len(self.sequence_preview_frames) <= 1:
@@ -3936,27 +4027,30 @@ class MainWindow(QMainWindow):
         if self.sequence_timer.isActive():
             self.sequence_timer.stop()
             self.preview_is_raw_playback = False
-            self.play_button.setText("Play")
+            self.update_playback_button(False)
             if self.color_preview_is_active():
                 self.show_sequence_frame(self.sequence_frame_index)
             return
         interval_ms = max(round(1000 / (self.current_fps if self.current_fps > 0 else 25.0)), 1)
         self.sequence_timer.start(interval_ms)
-        self.play_button.setText("Pause")
+        self.update_playback_button(True)
 
     def advance_sequence_frame(self) -> None:
         if not self.sequence_preview_frames:
             self.sequence_timer.stop()
-            self.play_button.setText("Play")
+            self.update_playback_button(False)
             return
         next_index = self.sequence_frame_index + 1
         if next_index >= len(self.sequence_preview_frames):
             self.sequence_timer.stop()
-            self.play_button.setText("Play")
+            self.update_playback_button(False)
             return
         self.show_sequence_frame(next_index)
 
     def seek_preview_position(self, value: int) -> None:
+        if hasattr(self, "rust_preview") and self.rust_preview.active:
+            self.rust_preview.seek(value)
+            return
         if self.preview_is_sequence:
             self.show_sequence_frame(value)
         elif self.preview_is_raw_playback and self.player:
@@ -3977,6 +4071,9 @@ class MainWindow(QMainWindow):
                 self.update_current_frame_label()
 
     def show_sequence_frame(self, index: int) -> None:
+        if hasattr(self, "rust_preview") and self.rust_preview.active:
+            self.rust_preview.seek(index)
+            return
         if not self.sequence_preview_frames:
             self.preview_placeholder.setText("Image sequence selected")
             self.update_current_frame_label()
@@ -4013,6 +4110,9 @@ class MainWindow(QMainWindow):
         self.update_current_frame_label()
 
     def refresh_preview_display_transform(self) -> None:
+        if hasattr(self, "rust_preview") and self.rust_preview.active:
+            self.rust_preview.refresh()
+            return
         if self.preview_is_raw_playback:
             return
         if self.sequence_preview_frames:
@@ -4061,7 +4161,7 @@ class MainWindow(QMainWindow):
         message = error_text or "Preview failed."
         self.preview_placeholder.setText(message)
         self.preview_placeholder.show()
-        self.play_button.setText("Play")
+        self.update_playback_button(False)
         self.record_error("Preview failed", message)
         self.progress_label.setText("Preview failed")
 
@@ -4081,8 +4181,8 @@ class MainWindow(QMainWindow):
         self.preview_proxy_requested_for = source_path
         self.progress_label.setText("Preparing preview proxy...")
         self.preview_placeholder.setText("Preparing preview proxy...")
-        self.play_button.setText("Play")
-        self.play_button.setEnabled(False)
+        self.update_playback_button(False)
+        self.set_playback_controls_enabled(False)
         worker = PreviewProxyWorker(source_path, preset, cache_key)
         worker.ready.connect(self.handle_preview_proxy_ready)
         worker.failed.connect(self.handle_preview_proxy_failed)
@@ -4090,7 +4190,7 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def handle_preview_proxy_ready(self, source_path: str, proxy_path: str, cache_key: str) -> None:
-        self.play_button.setEnabled(True)
+        self.set_playback_controls_enabled(True)
         self.preview_proxy_worker = None
         if self.preview_proxy_pending:
             self.preview_proxy_pending = False
@@ -4113,10 +4213,10 @@ class MainWindow(QMainWindow):
         self._start_preview_source()
         if self.player:
             self.player.play()
-            self.play_button.setText("Pause")
+            self.update_playback_button(True)
 
     def handle_preview_proxy_failed(self, source_path: str, message: str, traceback_text: str) -> None:
-        self.play_button.setEnabled(True)
+        self.set_playback_controls_enabled(True)
         self.preview_proxy_worker = None
         if self.preview_proxy_pending:
             self.preview_proxy_pending = False
@@ -4156,6 +4256,9 @@ class MainWindow(QMainWindow):
         return hashlib.sha1(payload.encode("utf-8")).hexdigest()
 
     def render_video_frame(self) -> None:
+        if hasattr(self, "rust_preview") and self.rust_preview.active:
+            self.rust_preview.refresh()
+            return
         if not self.preview_source_path or not self.preview_is_color_managed:
             return
         position_ms = self._current_position_ms()
@@ -4261,11 +4364,14 @@ class MainWindow(QMainWindow):
             self.preview_layout.addWidget(self.preview_placeholder)
         self.position_slider.setValue(0)
         self.update_current_frame_label()
-        self.play_button.setText("Play")
-        self.play_button.setEnabled(self.preview_source_path is not None and self.use_media)
+        self.update_playback_button(False)
+        self.set_playback_controls_enabled(self.preview_source_path is not None and self.use_media)
         self.position_slider.setEnabled(False)
 
     def step_preview_frames(self, delta: int) -> None:
+        if hasattr(self, "rust_preview") and self.rust_preview.active:
+            self.rust_preview.step(delta)
+            return
         if not self.preview_source_path or delta == 0:
             return
         if self.preview_is_sequence or self.sequence_preview_frames:
@@ -4399,6 +4505,8 @@ class MainWindow(QMainWindow):
         return str(self.time_mode_combo.currentData())
 
     def _current_position_ms(self) -> int:
+        if hasattr(self, "rust_preview") and self.rust_preview.active:
+            return self.rust_preview.engine.position_us // 1000
         if self.preview_is_sequence:
             return _frame_to_ms(self.sequence_frame_index, self.current_fps)
         if self.player:

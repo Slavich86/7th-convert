@@ -1,127 +1,82 @@
 @echo off
-setlocal EnableExtensions EnableDelayedExpansion
-
+setlocal EnableExtensions DisableDelayedExpansion
 set "APP_DIR=%~dp0"
 cd /d "%APP_DIR%" || exit /b 1
-
-set "MISSING=0"
-set "APP_PYTHON=python"
-set "APP_PYTHON_ARGS="
 set "VENV_DIR=%APP_DIR%.venv"
 set "VENV_PYTHON=%VENV_DIR%\Scripts\python.exe"
 set "REQUIREMENTS_FILE=%APP_DIR%requirements.txt"
+set "APP_PYTHON_ARGS="
 
+where ffmpeg >nul 2>nul
+if errorlevel 1 goto install_ffmpeg
+where ffprobe >nul 2>nul
+if errorlevel 1 goto install_ffmpeg
+
+:prepare_python
+set "APP_PYTHON=%VENV_PYTHON%"
+if exist "%VENV_PYTHON%" goto dependencies
+set "APP_PYTHON=python"
 where python >nul 2>nul
-if errorlevel 1 (
-    where py >nul 2>nul
-    if errorlevel 1 (
-        echo Missing required command: python or py 1>&2
-        set "MISSING=1"
-    ) else (
-        set "APP_PYTHON=py"
-        set "APP_PYTHON_ARGS=-3"
-    )
-)
+if not errorlevel 1 goto create_venv
+where py >nul 2>nul
+if errorlevel 1 goto missing_python
+set "APP_PYTHON=py"
+set "APP_PYTHON_ARGS=-3"
 
-call :require_command ffmpeg
-call :require_command ffprobe
+:create_venv
+where uv >nul 2>nul
+if errorlevel 1 goto create_standard_venv
+uv venv "%VENV_DIR%" --python ">=3.11"
+if errorlevel 1 exit /b 1
+goto use_venv
 
-if "%MISSING%"=="0" (
-    where uv >nul 2>nul
-    if errorlevel 1 (
-        echo uv is not available 1>&2
-        set /p "INSTALL_UV=Install uv via winget automatically? (Y/N): "
-        if /i "!INSTALL_UV!"=="Y" (
-            echo.
-            echo Running: winget install astral-sh.uv
-            winget install --id astral-sh.uv --exact --silent --accept-package-agreements --accept-source-agreements
-            if errorlevel 1 (
-                echo uv install failed; falling back to system Python. 1>&2
-            ) else (
-                echo uv installed. Please restart this terminal, or run the command below:
-                echo   "!LOCALAPPDATA!\Microsoft\WinGet\Links\uv.exe" -m seventh_convert.ui
-                pause
-                exit /b 1
-            )
-        )
-    )
-    where uv >nul 2>nul
-    if errorlevel 1 (
-        echo uv is not available; falling back to system Python. 1>&2
-    ) else (
-        if not exist "%VENV_PYTHON%" (
-            echo Creating Python virtual environment with uv: %VENV_DIR%
-            uv venv "%VENV_DIR%"
-            if errorlevel 1 (
-                echo uv failed to create .venv; falling back to system Python. 1>&2
-            )
-        )
+:create_standard_venv
+call :run_python -c "import sys; sys.exit(sys.version_info < (3, 11))"
+if errorlevel 1 goto missing_python
+call :run_python -m venv "%VENV_DIR%"
+if errorlevel 1 exit /b 1
+set "APP_PYTHON=%VENV_PYTHON%"
+set "APP_PYTHON_ARGS="
+call :run_python -m pip install -r "%REQUIREMENTS_FILE%"
+if errorlevel 1 exit /b 1
 
-        if exist "%VENV_PYTHON%" (
-            echo Installing Python dependencies into %VENV_DIR% with uv pip-compatible installer
-            uv pip install --python "%VENV_PYTHON%" --link-mode=copy -r "%REQUIREMENTS_FILE%"
-            if errorlevel 1 (
-                echo uv failed to install dependencies; falling back to system Python. 1>&2
-            ) else (
-                set "APP_PYTHON=%VENV_PYTHON%"
-                set "APP_PYTHON_ARGS="
-            )
-        )
-    )
-)
+:use_venv
+set "APP_PYTHON=%VENV_PYTHON%"
+set "APP_PYTHON_ARGS="
 
-if "%MISSING%"=="0" (
-    call :require_python_module numpy
-    call :require_python_module PySide6
-    call :require_python_module PyOpenColorIO
-    call :require_python_module OpenEXR
-)
+:dependencies
+call :run_python -c "import sys; sys.exit(sys.version_info < (3, 11))"
+if errorlevel 1 goto missing_python
+where uv >nul 2>nul
+if errorlevel 1 goto check_modules
+uv pip install --python "%VENV_PYTHON%" --link-mode=copy -r "%REQUIREMENTS_FILE%"
+if errorlevel 1 exit /b 1
 
-if not "%MISSING%"=="0" (
-    echo.
-    echo Install required dependencies first:
-    echo   Windows: install FFmpeg and add its bin folder to PATH.
-    echo   uv: winget install astral-sh.uv
-    echo.
-    echo Then run:
-    echo   7th-vfx-convertor.bat
-    echo.
-    echo Fallback without uv:
-    echo   python -m pip install -r requirements.txt
-    echo.
-    pause
-    exit /b 1
-)
-
+:check_modules
+call :run_python -c "import numpy, PySide6, PyOpenColorIO, OpenEXR"
+if errorlevel 1 goto missing_modules
+call :run_python -m seventh_convert.build_player --if-available
+if errorlevel 1 exit /b 1
 call :run_python -m seventh_convert.ui %*
 exit /b %ERRORLEVEL%
 
-:require_command
-where %1 >nul 2>nul
-if errorlevel 1 (
-    echo Missing required command: %1 1>&2
-    if /i "%1"=="ffmpeg" (
-        set /p "INSTALL_FFMPEG=Install FFmpeg automatically? (Y/N): "
-        if /i "!INSTALL_FFMPEG!"=="Y" (
-            echo.
-            call "%APP_DIR%install-ffmpeg.bat"
-            echo.
-            echo IMPORTANT: Open a NEW terminal and run 7th-vfx-convertor.bat again.
-            pause
-            exit /b 1
-        )
-    )
-    set "MISSING=1"
-)
-exit /b 0
+:install_ffmpeg
+set /p "INSTALL_FFMPEG=FFmpeg/ffprobe missing. Install via winget? (Y/N): "
+if /i not "%INSTALL_FFMPEG%"=="Y" exit /b 1
+call "%APP_DIR%install-ffmpeg.bat"
+if errorlevel 1 exit /b 1
+echo Open a NEW terminal and run "%APP_DIR%7th-vfx-convertor.bat" again.
+pause
+exit /b 1
 
-:require_python_module
-call :run_python -c "import importlib, sys; importlib.import_module(sys.argv[1])" %1 >nul 2>nul
-if errorlevel 1 (
-    echo Missing required Python module: %1 1>&2
-    set "MISSING=1"
-)
-exit /b 0
+:missing_python
+echo Python 3.11+ is required. Install Python, then recreate .venv on this computer. 1>&2
+exit /b 1
+
+:missing_modules
+echo Install missing dependencies into the local environment: 1>&2
+echo "%VENV_PYTHON%" -m pip install -r "%REQUIREMENTS_FILE%" 1>&2
+exit /b 1
 
 :run_python
 "%APP_PYTHON%" %APP_PYTHON_ARGS% %*

@@ -20,7 +20,9 @@ seventh_convert = [
   "color_configs/*/config.ocio",
   "color_configs/*/luts/*",
   "assets/icons/*",
-  "preset_data/*.json"
+  "preset_data/*.json",
+  "bin/seventh-player",
+  "bin/seventh-player.exe"
 ]
 
 [build-system]

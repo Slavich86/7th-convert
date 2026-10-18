@@ -359,3 +359,15 @@ def _positive_float(value: object) -> float | None:
     except (TypeError, ValueError):
         return None
     return result if result > 0 else None
+
+
+def build_player_color_filter(preset: Preset) -> str:
+    """Preview shares export color math, but keeps source geometry and timing.
+
+    Pixel aspect is applied by the display widget; export resize/FPS/frame-step
+    settings must never alter the player's source-frame addressing.
+    """
+    if preset.filters.get("ocio_lut_error"):
+        raise ValueError(str(preset.filters["ocio_lut_error"]))
+    filters = {key: preset.filters[key] for key in ("lut3d", "input_color_space", "output_color_space") if key in preset.filters}
+    return _video_filter(filters, preset.video) or ""
