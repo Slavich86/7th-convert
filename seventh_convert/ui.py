@@ -60,7 +60,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .command_builder import ConvertJob, build_ffmpeg_args
+from .command_builder import ConvertJob, build_ffmpeg_args, build_preview_frame_args, build_preview_proxy_args
 from .converter import format_command, output_exists_for_job, same_input_and_output, validate_job
 from .exr_metadata import preserve_exr_metadata_for_job
 from .ffprobe import duration_seconds, probe
@@ -983,56 +983,68 @@ class SelfUpdateWorker(QThread):
 
 
 class PreviewProxyWorker(QThread):
-    ready = Signal(str, str)
+    ready = Signal(str, str, str)
     failed = Signal(str, str, str)
 
-    def __init__(self, source_path: Path) -> None:
+    def __init__(self, source_path: Path, preset: Preset, cache_key: str) -> None:
         super().__init__()
         self.source_path = source_path
+        self.preset = preset
+        self.cache_key = cache_key
 
     def run(self) -> None:
         try:
-            proxy_path = _preview_proxy_path(self.source_path)
+            proxy_path = _preview_proxy_path(self.source_path, self.cache_key)
             if not proxy_path.exists():
                 proxy_path.parent.mkdir(parents=True, exist_ok=True)
-                args = [
-                    "ffmpeg",
-                    "-hide_banner",
-                    "-y",
-                    "-i",
-                    str(self.source_path),
-                    "-map",
-                    "0:v:0",
-                    "-map",
-                    "0:a:0?",
-                    "-sn",
-                    "-dn",
-                    "-vf",
-                    f"scale='min({PREVIEW_PROXY_MAX_WIDTH},iw)':-2:force_original_aspect_ratio=decrease",
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "veryfast",
-                    "-crf",
-                    "18",
-                    "-pix_fmt",
-                    "yuv420p",
-                    "-c:a",
-                    "aac",
-                    "-b:a",
-                    "160k",
-                    "-ac",
-                    "2",
-                    "-movflags",
-                    "+faststart",
-                    str(proxy_path),
-                ]
+                args = build_preview_proxy_args(self.source_path, proxy_path, self.preset, PREVIEW_PROXY_MAX_WIDTH)
                 completed = subprocess.run(args, text=True, capture_output=True, check=False)
                 if completed.returncode != 0:
                     raise RuntimeError(completed.stderr.strip() or "ffmpeg preview proxy failed")
-            self.ready.emit(str(self.source_path), str(proxy_path))
+            self.ready.emit(str(self.source_path), str(proxy_path), self.cache_key)
         except Exception as exc:  # noqa: BLE001 - worker reports concise UI errors.
             self.failed.emit(str(self.source_path), str(exc), traceback.format_exc())
+
+
+class PreviewFrameWorker(QThread):
+    ready = Signal(str, object, str, int)
+    failed = Signal(str, str, str)
+
+    def __init__(self, source_path: Path, preset: Preset, cache_key: str, position_ms: int | None = None) -> None:
+        super().__init__()
+        self.source_path = source_path
+        self.preset = preset
+        self.cache_key = cache_key
+        self.position_ms = position_ms
+        self.process: subprocess.Popen[bytes] | None = None
+
+    def run(self) -> None:
+        try:
+            self.process = subprocess.Popen(
+                build_preview_frame_args(self.source_path, None, self.preset, self.position_ms),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            stdout, stderr = self.process.communicate()
+            if self.isInterruptionRequested():
+                return
+            if self.process.returncode != 0:
+                raise RuntimeError(stderr.decode(errors="replace").strip() or "ffmpeg preview frame failed")
+            if not stdout:
+                raise RuntimeError("ffmpeg preview frame returned no image data")
+            self.ready.emit(str(self.source_path), stdout, self.cache_key, self.position_ms if self.position_ms is not None else -1)
+        except Exception as exc:  # noqa: BLE001 - worker reports concise UI errors.
+            if self.isInterruptionRequested():
+                return
+            self.failed.emit(str(self.source_path), str(exc), traceback.format_exc())
+        finally:
+            self.process = None
+
+    def cancel(self) -> None:
+        self.requestInterruption()
+        process = self.process
+        if process is not None and process.poll() is None:
+            process.terminate()
 
 
 @dataclass(frozen=True)
@@ -1459,6 +1471,20 @@ class MainWindow(QMainWindow):
         self.preview_proxy_path: Path | None = None
         self.preview_proxy_requested_for: Path | None = None
         self.preview_proxy_worker: PreviewProxyWorker | None = None
+        self.preview_proxy_cache_key = ""
+        self.preview_proxy_pending = False
+        self.preview_is_color_managed = False
+        self.preview_is_raw_playback = False
+        self.preview_frame_worker: PreviewFrameWorker | None = None
+        self.preview_frame_pixmap = QPixmap()
+        self.preview_frame_cache_key = ""
+        self.preview_frame_source_path: Path | None = None
+        self.preview_frame_position_ms: int | None = None
+        self.preview_frame_pending: tuple[Path, str, int | None] | None = None
+        self.preview_frame_render_timer = QTimer(self)
+        self.preview_frame_render_timer.setSingleShot(True)
+        self.preview_frame_render_timer.timeout.connect(self.render_video_frame)
+        self._video_color_position_ms: int | None = None
         self.current_input_is_sequence = False
         self.current_input_sequence_start: int | None = None
         self.current_input_sequence_end: int | None = None
@@ -1802,6 +1828,7 @@ class MainWindow(QMainWindow):
             "profile": self.selected_profile(),
             "fps": self.fps_edit.text().strip(),
             "fps_is_manual": self.fps_value_is_manual,
+            "frame_step": self.frame_step_spin.value(),
             "time_mode": self.time_mode_combo.currentData(),
             "in": self.in_edit.text().strip(),
             "out": self.out_edit.text().strip(),
@@ -1817,6 +1844,7 @@ class MainWindow(QMainWindow):
             "ocio_config_path": self.ocio_config_path,
             "input_transform": self.selected_input_transform(),
             "output_transform": self.selected_output_transform(),
+            "output_color_tags": self.selected_output_color_tags(),
             "jpg_quality": self.jpg_quality_slider.value(),
             "audio_format": self.audio_format_combo.currentData(),
             "audio_profile": self.audio_profile_combo.currentData(),
@@ -1844,6 +1872,10 @@ class MainWindow(QMainWindow):
 
         self.fps_value_is_manual = bool(converter.get("fps_is_manual", True))
         self.fps_edit.setText(str(converter.get("fps") or self.fps_edit.text()))
+        try:
+            self.frame_step_spin.setValue(int(converter.get("frame_step") or 1))
+        except (TypeError, ValueError):
+            self.frame_step_spin.setValue(1)
         self._set_combo_data(self.time_mode_combo, str(converter.get("time_mode") or self.time_mode_combo.currentData()))
         self.in_edit.setText(str(converter.get("in") or ""))
         self.out_edit.setText(str(converter.get("out") or ""))
@@ -1883,6 +1915,7 @@ class MainWindow(QMainWindow):
 
         self._set_combo_data(self.input_transform_combo, str(converter.get("input_transform") or self.selected_input_transform()))
         self._set_combo_data(self.output_transform_combo, str(converter.get("output_transform") or self.selected_output_transform()))
+        self._set_combo_data(self.output_color_tags_combo, str(converter.get("output_color_tags") or "auto"))
         self.scale_slider.setValue(int(converter.get("scale_slider") or round(float(converter.get("scale") or 1.0) * 1000)))
         if converter.get("output_width") and converter.get("output_height"):
             self._set_scale_controls(int(converter["output_width"]), int(converter["output_height"]), self.scale_slider.value() / 1000)
@@ -2121,6 +2154,13 @@ class MainWindow(QMainWindow):
         self.fps_edit.textChanged.connect(lambda _text: self.refresh_media_info_summary())
         layout.addRow(self.fps_label, self.fps_edit)
 
+        self.frame_step_label = QLabel("Frame Step")
+        self.frame_step_spin = QSpinBox()
+        self.frame_step_spin.setRange(1, 1_000_000)
+        self.frame_step_spin.setValue(1)
+        self.frame_step_spin.setToolTip("5 saves source frames 1, 5, 10, 15...")
+        layout.addRow(self.frame_step_label, self.frame_step_spin)
+
         self.codec_profile_label = QLabel("Codec Profile")
         self.codec_profile_combo = QComboBox()
         layout.addRow(self.codec_profile_label, self.codec_profile_combo)
@@ -2152,12 +2192,21 @@ class MainWindow(QMainWindow):
 
         self.input_transform_label = QLabel("Input Transform")
         self.output_transform_label = QLabel("Output Transform")
+        self.output_color_tags_label = QLabel("Output Color Tags")
         self.input_transform_combo = QComboBox()
         self.output_transform_combo = QComboBox()
+        self.output_color_tags_combo = QComboBox()
+        self.output_color_tags_combo.addItem("Auto", "auto")
+        self.output_color_tags_combo.addItem("sRGB / Full", "srgb")
+        self.output_color_tags_combo.addItem("Rec.709 / Limited", "rec709")
+        self.output_color_tags_combo.addItem("Rec.2020 HLG / Limited", "hlg")
+        self.output_color_tags_combo.addItem("Preserve Source", "preserve")
         self.input_transform_combo.currentIndexChanged.connect(lambda _index: self.refresh_preview_display_transform())
         self.output_transform_combo.currentIndexChanged.connect(lambda _index: self.handle_output_transform_changed())
+        self.output_color_tags_combo.currentIndexChanged.connect(lambda _index: self.handle_output_color_tags_changed())
         layout.addRow(self.input_transform_label, self.input_transform_combo)
         layout.addRow(self.output_transform_label, self.output_transform_combo)
+        layout.addRow(self.output_color_tags_label, self.output_color_tags_combo)
         self.refresh_color_transform_options()
         self.refresh_color_transform_visibility()
 
@@ -2179,6 +2228,7 @@ class MainWindow(QMainWindow):
         layout.addRow("Media Info", self.summary_text)
 
         self.refresh_output_controls()
+        self.refresh_frame_step_visibility()
         self.refresh_pixel_aspect_controls()
         return group
 
@@ -2282,6 +2332,7 @@ class MainWindow(QMainWindow):
         self.fps_value_is_manual = False
         self.input_range_edit.setText(self._selected_range_text())
         self.refresh_audio_controls()
+        self.refresh_frame_step_visibility()
         self._prepare_preview_source(selected.preview_path, selected.is_sequence)
         self.refresh_color_transform_defaults()
         next_output_path = self._auto_output_path(
@@ -2398,6 +2449,7 @@ class MainWindow(QMainWindow):
         self.fps_value_is_manual = False
         self.input_range_edit.setText(self._selected_range_text())
         self.refresh_audio_controls()
+        self.refresh_frame_step_visibility()
         self.refresh_color_transform_defaults()
         self.refresh_fps_control_visibility()
         if not self.output_path_is_manual or not self.output_edit.text().strip():
@@ -2620,6 +2672,7 @@ class MainWindow(QMainWindow):
         self.refresh_profile_controls()
         self.refresh_fps_control_visibility()
         self.refresh_jpg_quality_visibility()
+        self.refresh_frame_step_visibility()
         self.refresh_output_path_extension()
         self.refresh_color_transform_defaults()
         self.refresh_scale_controls()
@@ -2749,6 +2802,10 @@ class MainWindow(QMainWindow):
     def handle_output_transform_changed(self) -> None:
         self.refresh_output_path_extension()
         self.refresh_media_info_summary()
+        self.refresh_preview_display_transform()
+
+    def handle_output_color_tags_changed(self) -> None:
+        self.refresh_preview_display_transform()
 
     def refresh_output_path_extension(self) -> None:
         if not hasattr(self, "output_edit"):
@@ -2869,6 +2926,9 @@ class MainWindow(QMainWindow):
     def selected_output_transform_label(self) -> str:
         return self.output_transform_combo.currentText() or self.selected_output_transform()
 
+    def selected_output_color_tags(self) -> str:
+        return str(self.output_color_tags_combo.currentData() or "auto")
+
     def selected_output_codec_label(self) -> str:
         codec = self.codec_combo.currentText()
         profile = self.codec_profile_combo.currentText()
@@ -2912,6 +2972,8 @@ class MainWindow(QMainWindow):
             self.input_transform_combo,
             self.output_transform_label,
             self.output_transform_combo,
+            self.output_color_tags_label,
+            self.output_color_tags_combo,
         ):
             widget.setVisible(visible)
 
@@ -3027,9 +3089,10 @@ class MainWindow(QMainWindow):
         if self.color_workflow == COLOR_WORKFLOW_NONE:
             for key in ("color_primaries", "color_trc", "colorspace", "color_range"):
                 video.pop(key, None)
-        video.update(_video_color_metadata_for_output_transform(selected_output_transform, file_type))
+        video.update(_output_color_metadata(self.selected_output_color_tags(), selected_output_transform, file_type))
         filters["input_color_space"] = _command_color_space_value(selected_input_transform)
         filters["output_color_space"] = _command_color_space_value(selected_output_transform)
+        filters["output_color_tags"] = self.selected_output_color_tags()
         ocio_input_color_space = _ocio_color_space_name(selected_input_transform)
         ocio_output_color_space = _ocio_color_space_name(selected_output_transform)
         if ocio_input_color_space:
@@ -3116,6 +3179,17 @@ class MainWindow(QMainWindow):
         self.jpg_quality_label.setEnabled(enabled)
         self.jpg_quality_slider.setEnabled(enabled)
         self.jpg_quality_value_label.setEnabled(enabled)
+
+    def frame_step_is_available(self) -> bool:
+        return self.input_is_video_file() and bool(OUTPUT_OPTIONS[self.selected_file_type()].get("sequence"))
+
+    def refresh_frame_step_visibility(self) -> None:
+        if not hasattr(self, "frame_step_spin"):
+            return
+        visible = self.frame_step_is_available()
+        self.frame_step_label.setVisible(visible)
+        self.frame_step_spin.setVisible(visible)
+        self.frame_step_spin.setEnabled(visible)
 
     def refresh_scale_controls(self) -> None:
         if not hasattr(self, "scale_slider"):
@@ -3270,6 +3344,8 @@ class MainWindow(QMainWindow):
         if input_start_number is None:
             input_start_number = sequence_start_number(input_path)
         in_point, out_point = self._range_points_for_job()
+        frame_step = self.frame_step_spin.value() if self.frame_step_is_available() else None
+        source_frame_start, source_frame_end = self._source_frame_range_for_job() if frame_step is not None else (0, None)
         return ConvertJob(
             input=input_path,
             output=output_path,
@@ -3279,6 +3355,9 @@ class MainWindow(QMainWindow):
             output_start_number=self._output_sequence_start_number(preset, input_start_number),
             in_point=in_point,
             out_point=out_point,
+            frame_step=frame_step,
+            source_frame_start=source_frame_start,
+            source_frame_end=source_frame_end,
             overwrite=self.overwrite_check.isChecked(),
         )
 
@@ -3303,6 +3382,13 @@ class MainWindow(QMainWindow):
             _ms_to_time(in_ms) if in_ms is not None else None,
             _ms_to_time(out_ms) if out_ms is not None else None,
         )
+
+    def _source_frame_range_for_job(self) -> tuple[int, int | None]:
+        in_ms = self._edit_value_to_ms(self.in_edit.text().strip())
+        out_ms = self._edit_value_to_ms(self.out_edit.text().strip())
+        start = _ms_to_frame(in_ms, self.current_fps) if in_ms is not None else 0
+        end = _ms_to_frame(out_ms, self.current_fps) if out_ms not in {None, 0} else None
+        return start, end
 
     def copy_command(self) -> None:
         try:
@@ -3382,6 +3468,10 @@ class MainWindow(QMainWindow):
         scale = filters.get("scale")
         if isinstance(scale, dict) and scale.get("mode") == "dimensions":
             output_size = f"{scale.get('width')} x {scale.get('height')} px"
+        source_frame_range = "-"
+        if job.frame_step is not None:
+            end = str(job.source_frame_end) if job.source_frame_end is not None else "end"
+            source_frame_range = f"{job.source_frame_start + 1}-{end}"
         return "\n".join([
             f"Input: {job.input}",
             f"Audio Input: {job.audio_input if job.audio_input else '-'}",
@@ -3395,6 +3485,8 @@ class MainWindow(QMainWindow):
             f"FPS: {filters.get('fps', 'source')}",
             f"In: {job.in_point or '-'}",
             f"Out: {job.out_point or '-'}",
+            f"Frame Step: {job.frame_step or '-'}",
+            f"Source Frame Range: {source_frame_range}",
             f"Scale: {scale}",
             f"Output Size: {output_size}",
             f"Pixel Aspect: {filters.get('output_pixel_aspect', '1.0')}",
@@ -3402,6 +3494,7 @@ class MainWindow(QMainWindow):
             f"Color Management: {self.color_workflow}",
             f"Input Transform: {_log_transform_value(filters, 'input')}",
             f"Output Transform: {_log_transform_value(filters, 'output')}",
+            f"Output Color Tags: {filters.get('output_color_tags', 'auto')}",
             f"Copy Video + External Audio: {bool(filters.get('copy_video_with_external_audio'))}",
             "",
             "FFmpeg Command:",
@@ -3695,6 +3788,13 @@ class MainWindow(QMainWindow):
         self.preview_is_sequence = is_sequence
         self.preview_proxy_path = None
         self.preview_proxy_requested_for = None
+        self.preview_proxy_cache_key = ""
+        self.preview_is_color_managed = False
+        self.preview_is_raw_playback = False
+        self.preview_frame_pixmap = QPixmap()
+        self.preview_frame_cache_key = ""
+        self.preview_frame_source_path = None
+        self.preview_frame_position_ms = None
         self.current_source_raster_size = None
         self.refresh_scale_controls()
         self.position_slider.setValue(0)
@@ -3748,9 +3848,15 @@ class MainWindow(QMainWindow):
             return
 
         self.play_button.setEnabled(True)
+        if self.color_preview_is_active():
+            self.preview_is_color_managed = True
+            self.play_button.setEnabled(True)
+            self.position_slider.setEnabled(True)
+            self.render_video_frame()
+            return
         self._start_preview_source()
 
-    def _start_preview_source(self) -> None:
+    def _start_preview_source(self, raw_playback: bool = False) -> None:
         if not self.use_media or not self.preview_source_path:
             return
         if self.player:
@@ -3772,7 +3878,7 @@ class MainWindow(QMainWindow):
         self.player.durationChanged.connect(self.position_slider.setMaximum)
         self.position_slider.setEnabled(True)
 
-        source_path = self.preview_proxy_path or self.preview_source_path
+        source_path = self.preview_source_path if raw_playback else (self.preview_proxy_path or self.preview_source_path)
         self.player.setSource(QUrl.fromLocalFile(str(source_path)))
 
     def handle_video_frame_changed(self, frame: QVideoFrame) -> None:
@@ -3781,7 +3887,18 @@ class MainWindow(QMainWindow):
             return
         self._last_video_source_pixmap = QPixmap.fromImage(image)
         self.update_source_raster_size(self._last_video_source_pixmap.size())
-        self._refresh_video_display_transform()
+        if self.preview_is_raw_playback:
+            self.preview_placeholder.set_source_pixmap(
+                self._last_video_source_pixmap,
+                self.selected_pixel_aspect_for_path(self._current_preview_frame_path()),
+            )
+        elif self.preview_is_color_managed:
+            self.preview_placeholder.set_source_pixmap(
+                self._last_video_source_pixmap,
+                self.selected_pixel_aspect_for_path(self._current_preview_frame_path()),
+            )
+        else:
+            self._refresh_video_display_transform()
 
     def handle_player_position_changed(self, position_ms: int) -> None:
         self.position_slider.setValue(position_ms)
@@ -3789,16 +3906,27 @@ class MainWindow(QMainWindow):
 
     def toggle_playback(self) -> None:
         if self.preview_is_sequence:
+            if not self.preview_is_raw_playback:
+                self.preview_is_raw_playback = True
+                self.preview_frame_render_timer.stop()
             self.toggle_sequence_playback()
             return
         if not self.player and self.preview_source_path:
-            self._start_preview_source()
+            self.preview_is_raw_playback = True
+            self.preview_frame_render_timer.stop()
+            self._start_preview_source(raw_playback=True)
+            if self.player:
+                self.player.setPosition(self._current_position_ms())
         if not self.player:
             return
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.player.pause()
+            self.preview_is_raw_playback = False
             self.play_button.setText("Play")
+            if self.preview_is_color_managed:
+                self.render_video_frame()
         else:
+            self.preview_is_raw_playback = True
             self.player.play()
             self.play_button.setText("Pause")
 
@@ -3807,7 +3935,10 @@ class MainWindow(QMainWindow):
             return
         if self.sequence_timer.isActive():
             self.sequence_timer.stop()
+            self.preview_is_raw_playback = False
             self.play_button.setText("Play")
+            if self.color_preview_is_active():
+                self.show_sequence_frame(self.sequence_frame_index)
             return
         interval_ms = max(round(1000 / (self.current_fps if self.current_fps > 0 else 25.0)), 1)
         self.sequence_timer.start(interval_ms)
@@ -3828,6 +3959,12 @@ class MainWindow(QMainWindow):
     def seek_preview_position(self, value: int) -> None:
         if self.preview_is_sequence:
             self.show_sequence_frame(value)
+        elif self.preview_is_raw_playback and self.player:
+            self.player.setPosition(value)
+        elif self.preview_is_color_managed:
+            self.position_slider.setValue(value)
+            self.update_current_frame_label()
+            self.preview_frame_render_timer.start(200)
         elif self.player:
             self.player.setPosition(value)
         else:
@@ -3846,7 +3983,20 @@ class MainWindow(QMainWindow):
             return
         self.sequence_frame_index = max(0, min(index, len(self.sequence_preview_frames) - 1))
         frame = self.sequence_preview_frames[self.sequence_frame_index]
-        pixmap = _preview_pixmap_for_path(frame)
+        preview_cache_key = self._preview_cache_key(frame, self.current_preset(), "frame")
+        color_managed = self.color_preview_is_active() and not self.preview_is_raw_playback
+        ram_preview_ready = (
+            color_managed
+            and self.preview_frame_cache_key == preview_cache_key
+            and self.preview_frame_source_path == frame
+            and not self.preview_frame_pixmap.isNull()
+        )
+        if ram_preview_ready:
+            pixmap = self.preview_frame_pixmap
+        else:
+            pixmap = _preview_pixmap_for_path(frame)
+            if color_managed:
+                self.start_preview_frame_generation(frame, preview_cache_key)
         self.preview_placeholder.clear()
         if pixmap.isNull():
             self.preview_placeholder.setText(frame.name)
@@ -3854,7 +4004,8 @@ class MainWindow(QMainWindow):
             return
         self.update_source_raster_size(pixmap.size())
         self._sync_auto_pixel_aspect_edit(frame)
-        pixmap = self._display_pixmap_for_selected_input_transform(pixmap)
+        if not self.preview_is_raw_playback and not ram_preview_ready:
+            pixmap = self._display_pixmap_for_selected_input_transform(pixmap)
         self.preview_placeholder.set_source_pixmap(pixmap, self.selected_pixel_aspect_for_path(frame))
         self.position_slider.blockSignals(True)
         self.position_slider.setValue(self.sequence_frame_index)
@@ -3862,8 +4013,12 @@ class MainWindow(QMainWindow):
         self.update_current_frame_label()
 
     def refresh_preview_display_transform(self) -> None:
+        if self.preview_is_raw_playback:
+            return
         if self.sequence_preview_frames:
             self.show_sequence_frame(self.sequence_frame_index)
+        elif self.preview_source_path and self.preview_is_color_managed:
+            self.render_video_frame()
         elif not self._last_video_source_pixmap.isNull():
             self._refresh_video_display_transform()
 
@@ -3911,25 +4066,39 @@ class MainWindow(QMainWindow):
         self.progress_label.setText("Preview failed")
 
     def start_preview_proxy_generation(self, source_path: Path) -> None:
+        preset = self.current_preset()
+        cache_key = self._preview_cache_key(source_path, preset, "proxy")
+        proxy_path = _preview_proxy_path(source_path, cache_key)
+        self.preview_proxy_cache_key = cache_key
+        self.preview_is_color_managed = False
         worker = self.preview_proxy_worker
         if worker is not None and worker.isRunning():
+            self.preview_proxy_pending = True
+            return
+        if proxy_path.exists():
+            self.handle_preview_proxy_ready(str(source_path), str(proxy_path), cache_key)
             return
         self.preview_proxy_requested_for = source_path
         self.progress_label.setText("Preparing preview proxy...")
-        self.preview_placeholder.setText("Unsupported source codec in Qt backend. Preparing preview proxy...")
+        self.preview_placeholder.setText("Preparing preview proxy...")
         self.play_button.setText("Play")
         self.play_button.setEnabled(False)
-        worker = PreviewProxyWorker(source_path)
+        worker = PreviewProxyWorker(source_path, preset, cache_key)
         worker.ready.connect(self.handle_preview_proxy_ready)
         worker.failed.connect(self.handle_preview_proxy_failed)
         self.preview_proxy_worker = worker
         worker.start()
 
-    def handle_preview_proxy_ready(self, source_path: str, proxy_path: str) -> None:
+    def handle_preview_proxy_ready(self, source_path: str, proxy_path: str, cache_key: str) -> None:
         self.play_button.setEnabled(True)
         self.preview_proxy_worker = None
+        if self.preview_proxy_pending:
+            self.preview_proxy_pending = False
+            if self.preview_source_path is not None:
+                self.start_preview_proxy_generation(self.preview_source_path)
+            return
         current_source = self.preview_source_path
-        if current_source is None or str(current_source) != source_path:
+        if current_source is None or str(current_source) != source_path or cache_key != self.preview_proxy_cache_key:
             return
         self.preview_proxy_path = Path(proxy_path)
         self.progress_label.setText("Preview proxy ready")
@@ -3949,12 +4118,123 @@ class MainWindow(QMainWindow):
     def handle_preview_proxy_failed(self, source_path: str, message: str, traceback_text: str) -> None:
         self.play_button.setEnabled(True)
         self.preview_proxy_worker = None
+        if self.preview_proxy_pending:
+            self.preview_proxy_pending = False
+            if self.preview_source_path is not None:
+                self.start_preview_proxy_generation(self.preview_source_path)
+            return
         current_source = self.preview_source_path
         if current_source is None or str(current_source) != source_path:
             return
         self.progress_label.setText("Preview proxy failed")
         self.preview_placeholder.setText(message)
         self.record_error("Preview proxy failed", message, traceback_text=traceback_text)
+
+    def color_preview_is_active(self) -> bool:
+        if self.color_workflow == COLOR_WORKFLOW_NONE:
+            return False
+        return self.selected_input_transform() != self.selected_output_transform()
+
+    def _preview_cache_key(self, source_path: Path, preset: Preset, kind: str, position_ms: int | None = None) -> str:
+        try:
+            stat = source_path.stat()
+            source_stamp = f"{source_path.resolve()}|{stat.st_mtime_ns}|{stat.st_size}"
+        except OSError:
+            source_stamp = str(source_path)
+        payload = json.dumps(
+            {
+                "kind": kind,
+                "source": source_stamp,
+                "video": preset.video,
+                "filters": preset.filters,
+                "output": preset.output,
+                "position_ms": position_ms,
+            },
+            sort_keys=True,
+            default=str,
+        )
+        return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+    def render_video_frame(self) -> None:
+        if not self.preview_source_path or not self.preview_is_color_managed:
+            return
+        position_ms = self._current_position_ms()
+        cache_key = self._preview_cache_key(self.preview_source_path, self.current_preset(), "videoframe", position_ms=position_ms)
+        self._video_color_position_ms = position_ms
+        if (
+            self.preview_frame_cache_key == cache_key
+            and self.preview_frame_source_path == self.preview_source_path
+            and self.preview_frame_position_ms == position_ms
+            and not self.preview_frame_pixmap.isNull()
+        ):
+            self._show_video_color_frame(self.preview_frame_pixmap, position_ms)
+            return
+        self.start_preview_frame_generation(self.preview_source_path, cache_key, position_ms)
+
+    def _show_video_color_frame(self, pixmap: QPixmap, position_ms: int) -> None:
+        if position_ms != self._current_position_ms():
+            return
+        if pixmap.isNull():
+            return
+        self.update_source_raster_size(pixmap.size())
+        self.preview_placeholder.clear()
+        self.preview_placeholder.set_source_pixmap(pixmap, self.selected_pixel_aspect_for_path(self._current_preview_frame_path()))
+        self.update_current_frame_label()
+
+    def start_preview_frame_generation(self, source_path: Path, cache_key: str, position_ms: int | None = None) -> None:
+        worker = self.preview_frame_worker
+        if worker is not None and worker.isRunning():
+            worker.cancel()
+            self.preview_frame_pending = (source_path, cache_key, position_ms)
+            return
+        worker = PreviewFrameWorker(source_path, self.current_preset(), cache_key, position_ms)
+        worker.ready.connect(self.handle_preview_frame_ready)
+        worker.failed.connect(self.handle_preview_frame_failed)
+        worker.finished.connect(lambda worker=worker: self._handle_preview_frame_worker_finished(worker))
+        self.preview_frame_worker = worker
+        worker.start()
+
+    def handle_preview_frame_ready(self, source_path: str, image_data: object, cache_key: str, position_ms: int) -> None:
+        self.preview_frame_worker = None
+        pixmap = QPixmap()
+        if isinstance(image_data, (bytes, bytearray)):
+            pixmap.loadFromData(bytes(image_data), "PNG")
+        if pixmap.isNull():
+            self.record_error("Preview frame failed", "Rendered preview image could not be decoded")
+            return
+        self.preview_frame_pixmap = pixmap
+        self.preview_frame_cache_key = cache_key
+        self.preview_frame_source_path = Path(source_path)
+        self.preview_frame_position_ms = position_ms if position_ms >= 0 else None
+        if self.preview_frame_pending is not None:
+            pending_source, pending_key, pending_position = self.preview_frame_pending
+            self.preview_frame_pending = None
+            self.start_preview_frame_generation(pending_source, pending_key, pending_position)
+            return
+        if position_ms >= 0:
+            self._show_video_color_frame(pixmap, position_ms)
+            return
+        current = self._current_preview_frame_path()
+        if current is not None and str(current) == source_path:
+            self.show_sequence_frame(self.sequence_frame_index)
+
+    def _handle_preview_frame_worker_finished(self, worker: PreviewFrameWorker) -> None:
+        if self.preview_frame_worker is not worker:
+            return
+        self.preview_frame_worker = None
+        if self.preview_frame_pending is not None:
+            pending_source, pending_key, pending_position = self.preview_frame_pending
+            self.preview_frame_pending = None
+            self.start_preview_frame_generation(pending_source, pending_key, pending_position)
+
+    def handle_preview_frame_failed(self, source_path: str, message: str, traceback_text: str) -> None:
+        self.preview_frame_worker = None
+        if self.preview_frame_pending is not None:
+            pending_source, pending_key, pending_position = self.preview_frame_pending
+            self.preview_frame_pending = None
+            self.start_preview_frame_generation(pending_source, pending_key, pending_position)
+            return
+        self.record_error("Preview frame failed", message, traceback_text=traceback_text)
 
     def reset_preview_after_finished(self) -> None:
         self.sequence_timer.stop()
@@ -3996,7 +4276,11 @@ class MainWindow(QMainWindow):
         if self.position_slider.maximum() > 0:
             target_ms = min(target_ms, self.position_slider.maximum())
         target_ms = max(target_ms, 0)
-        if self.player:
+        if self.preview_is_color_managed:
+            self.position_slider.setValue(target_ms)
+            self.update_current_frame_label()
+            self.render_video_frame()
+        elif self.player:
             self.player.setPosition(target_ms)
         else:
             self.position_slider.setValue(target_ms)
@@ -4476,9 +4760,8 @@ def _cached_exr_pixel_aspect_ratio(path: str, _mtime_ns: int) -> float:
 
 
 def _preview_pixmap_for_path(path: Path) -> QPixmap:
-    pixmap = QPixmap(str(path))
-    if not pixmap.isNull() or path.suffix.lower() != ".exr":
-        return pixmap
+    if path.suffix.lower() != ".exr":
+        return QPixmap.fromImage(QImage(str(path)))
     return _load_exr_preview_pixmap(path)
 
 
@@ -4495,7 +4778,7 @@ def _load_exr_preview_pixmap(path: Path) -> QPixmap:
     return QPixmap.fromImage(image)
 
 
-@lru_cache(maxsize=128)
+@lru_cache(maxsize=1)
 def _cached_exr_preview_image(path: str, _mtime_ns: int) -> QImage | None:
     if np is None:
         return None
@@ -4591,29 +4874,65 @@ def _command_color_space_value(value: str) -> str:
 
 
 def _video_color_metadata_for_output_transform(output_transform: str, file_type: str) -> dict[str, str]:
-    if file_type not in {"mov", "mp4"}:
+    if file_type not in {"mov", "mp4", "png", "jpg"}:
         return {}
+    is_still_output = file_type in {"png", "jpg"}
     color_space = _ocio_color_space_name(output_transform) or output_transform
     normalized = color_space.lower()
-    if normalized in {"rec709", "rec.709", "bt709"}:
-        return {
+    if normalized in {"rec709", "rec.709", "bt709", "rec709_display"}:
+        metadata = {
             "color_primaries": "bt709",
             "color_trc": "bt709",
             "colorspace": "bt709",
         }
-    if normalized in {"srgb", "output - srgb"}:
-        return {
+        if is_still_output:
+            metadata["color_range"] = "pc"
+        return metadata
+    if normalized in {"srgb", "output - srgb", "srgb_texture"}:
+        metadata = {
             "color_primaries": "bt709",
             "color_trc": "iec61966-2-1",
             "colorspace": "bt709",
         }
+        if is_still_output:
+            metadata["color_range"] = "pc"
+        return metadata
     if normalized in {"linear"}:
-        return {
+        metadata = {
             "color_primaries": "bt709",
             "color_trc": "linear",
             "colorspace": "bt709",
         }
+        if is_still_output:
+            metadata["color_range"] = "pc"
+        return metadata
+    if "hlg" in normalized and "2020" in normalized:
+        return {
+            "color_primaries": "bt2020",
+            "color_trc": "arib-std-b67",
+            "colorspace": "bt2020nc",
+            "color_range": "tv",
+        }
     return {}
+
+
+def _output_color_metadata(policy: str, output_transform: str, file_type: str) -> dict[str, str]:
+    if policy == "preserve":
+        return {}
+    if policy == "srgb":
+        return _video_color_metadata_for_output_transform("srgb", file_type)
+    if policy == "rec709":
+        metadata = _video_color_metadata_for_output_transform("rec709", file_type)
+        metadata["color_range"] = "tv"
+        return metadata
+    if policy == "hlg":
+        return {
+            "color_primaries": "bt2020",
+            "color_trc": "arib-std-b67",
+            "colorspace": "bt2020nc",
+            "color_range": "tv",
+        }
+    return _video_color_metadata_for_output_transform(output_transform, file_type)
 
 
 def _log_transform_value(filters: dict, side: str) -> str:
@@ -4740,14 +5059,10 @@ def _ocio_lut_is_required(input_transform: str, output_transform: str) -> bool:
     return bool(input_color_space and output_color_space and input_color_space != output_color_space)
 
 
-def _preview_proxy_path(source_path: Path) -> Path:
-    try:
-        stat = source_path.stat()
-        stamp = f"{stat.st_mtime_ns}:{stat.st_size}"
-    except OSError:
-        stamp = "missing"
-    cache_key = hashlib.sha1(f"preview-proxy-v1|{source_path.resolve()}|{stamp}".encode("utf-8")).hexdigest()
+def _preview_proxy_path(source_path: Path, cache_key: str) -> Path:
     return Path(tempfile.gettempdir()) / "7th-convert" / "preview_proxy" / f"{cache_key}.mp4"
+
+
 
 
 def _ocio_color_space_name(value: str) -> str | None:

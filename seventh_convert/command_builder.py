@@ -23,18 +23,22 @@ class ConvertJob:
     output_start_number: int | None = None
     in_point: str | None = None
     out_point: str | None = None
+    frame_step: int | None = None
+    source_frame_start: int = 0
+    source_frame_end: int | None = None
     overwrite: bool = False
 
 
 def build_ffmpeg_args(job: ConvertJob) -> list[str]:
     args: list[str] = ["ffmpeg", "-hide_banner"]
+    sampled_sequence = job.frame_step is not None
 
     if job.overwrite:
         args.append("-y")
     else:
         args.append("-n")
 
-    if job.in_point:
+    if job.in_point and not sampled_sequence:
         args.extend(["-ss", job.in_point])
 
     if job.input_start_number is not None:
@@ -44,7 +48,7 @@ def build_ffmpeg_args(job: ConvertJob) -> list[str]:
     if job.audio_input is not None:
         args.extend(["-i", str(job.audio_input)])
 
-    if job.out_point:
+    if job.out_point and not sampled_sequence:
         args.extend(["-to", job.out_point])
 
     video = job.preset.video
@@ -57,7 +61,7 @@ def build_ffmpeg_args(job: ConvertJob) -> list[str]:
             args.extend(["-map", "1:a:0"])
 
     if video.get("enabled", True):
-        _append_video_args(args, video, filters)
+        _append_video_args(args, video, filters, job)
     else:
         args.append("-vn")
 
@@ -68,14 +72,77 @@ def build_ffmpeg_args(job: ConvertJob) -> list[str]:
     else:
         args.append("-an")
 
-    if job.output_start_number is not None:
+    if sampled_sequence:
+        args.extend(["-fps_mode", "passthrough", "-frame_pts", "1"])
+    elif job.output_start_number is not None:
         args.extend(["-start_number", str(job.output_start_number)])
 
     args.append(str(job.output))
     return args
 
 
-def _append_video_args(args: list[str], video: dict, filters: dict) -> None:
+def build_preview_frame_args(input_path: Path, output_path: Path | None, preset: Preset, position_ms: int | None = None) -> list[str]:
+    """Render one preview frame through the same filters used by export."""
+    args = ["ffmpeg", "-hide_banner", "-y"]
+    if position_ms is not None:
+        args.extend(["-ss", _milliseconds_to_ffmpeg_time(max(position_ms, 0))])
+    args.extend(["-i", str(input_path)])
+    vf = _video_filter(preset.filters, preset.video)
+    if vf:
+        args.extend(["-vf", vf])
+    args.extend(["-frames:v", "1", "-c:v", "png", "-pix_fmt", "rgb24", "-an"])
+    if output_path is None:
+        args.extend(["-f", "image2pipe", "pipe:1"])
+    else:
+        args.append(str(output_path))
+    return args
+
+
+def build_preview_proxy_args(input_path: Path, output_path: Path, preset: Preset, max_width: int) -> list[str]:
+    """Render a playback proxy through the same color filters used by export."""
+    args = [
+        "ffmpeg",
+        "-hide_banner",
+        "-y",
+        "-i",
+        str(input_path),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        "-sn",
+        "-dn",
+    ]
+    vf = _video_filter(preset.filters, preset.video)
+    scale = f"scale='min({max_width},iw)':-2:force_original_aspect_ratio=decrease"
+    args.extend(["-vf", f"{vf},{scale}" if vf else scale])
+    for key in ("color_primaries", "color_trc", "colorspace", "color_range"):
+        value = preset.video.get(key)
+        if value:
+            args.extend([f"-{key}", str(value)])
+    args.extend([
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "18",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "160k",
+        "-ac",
+        "2",
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ])
+    return args
+
+
+def _append_video_args(args: list[str], video: dict, filters: dict, job: ConvertJob) -> None:
     codec = video.get("codec")
     if codec:
         args.extend(["-c:v", codec])
@@ -123,10 +190,10 @@ def _append_video_args(args: list[str], video: dict, filters: dict) -> None:
             args.extend([f"-{key}", str(value)])
 
     if video.get("palette"):
-        _append_palette_filter_args(args, filters, video)
+        _append_palette_filter_args(args, filters, video, job)
         return
 
-    vf = _video_filter(filters, video)
+    vf = _video_filter(filters, video, job)
     if vf:
         args.extend(["-vf", vf])
 
@@ -149,8 +216,11 @@ def _append_audio_args(args: list[str], audio: dict) -> None:
         args.extend(["-ac", str(channels)])
 
 
-def _video_filter(filters: dict, video: dict | None = None) -> str | None:
+def _video_filter(filters: dict, video: dict | None = None, job: ConvertJob | None = None) -> str | None:
     parts: list[str] = []
+
+    if job and job.frame_step is not None:
+        parts.append(_source_frame_selection_filter(job))
 
     lut3d = filters.get("lut3d")
     if lut3d:
@@ -206,8 +276,8 @@ def _video_filter(filters: dict, video: dict | None = None) -> str | None:
     return ",".join(parts)
 
 
-def _append_palette_filter_args(args: list[str], filters: dict, video: dict) -> None:
-    vf = _video_filter(filters, video)
+def _append_palette_filter_args(args: list[str], filters: dict, video: dict, job: ConvertJob) -> None:
+    vf = _video_filter(filters, video, job)
     source = f"[0:v]{vf}," if vf else "[0:v]"
     palettegen = video.get("palettegen", {}) if isinstance(video.get("palettegen"), dict) else {}
     paletteuse = video.get("paletteuse", {}) if isinstance(video.get("paletteuse"), dict) else {}
@@ -249,6 +319,34 @@ def _color_metadata_filter(video: dict) -> str | None:
     if not options:
         return None
     return f"setparams={':'.join(options)}"
+
+
+def _source_frame_selection_filter(job: ConvertJob) -> str:
+    step = job.frame_step
+    if not isinstance(step, int) or step < 1:
+        raise ValueError("Frame step must be a positive integer")
+    if not job.preset.output.get("requires_pattern"):
+        raise ValueError("Frame step is available only for image sequence output")
+    if job.source_frame_start < 0:
+        raise ValueError("Source frame start must not be negative")
+    if job.source_frame_end is not None and job.source_frame_end <= job.source_frame_start:
+        raise ValueError("Source frame end must be greater than source frame start")
+
+    range_parts = [f"gte(n\\,{job.source_frame_start})"]
+    if job.source_frame_end is not None:
+        range_parts.append(f"lt(n\\,{job.source_frame_end})")
+    range_parts.append(f"(eq(n\\,{job.source_frame_start})+not(mod(n+1\\,{step})))")
+
+    # PTS becomes the 1-based source frame number for image2's -frame_pts names.
+    return f"setpts=N+1,select='{ '*'.join(range_parts) }'"
+
+
+def _milliseconds_to_ffmpeg_time(position_ms: int) -> str:
+    total = max(position_ms, 0) / 1000
+    hours = int(total // 3600)
+    minutes = int((total % 3600) // 60)
+    seconds = total % 60
+    return f"{hours:02d}:{minutes:02d}:{seconds:06.3f}"
 
 
 def _escape_filter_path(path: str) -> str:

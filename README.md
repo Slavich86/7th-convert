@@ -158,6 +158,7 @@ The `.desktop` file is for Linux and expects `7th-vfx-convertor.sh` to be in the
 - Show the current frame.
 - Set In / Out markers.
 - Convert a full file or only the selected range.
+- For video → image sequence, save the first frame and every Nth frame with global source-frame numbering, for example `0001`, `0005`, `0010` with `Frame Step = 5`.
 - Convert multiple jobs through the queue.
 - Save and load user presets.
 - Remember the last folders for video/image input, audio input, and presets.
