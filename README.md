@@ -133,18 +133,11 @@ Active in the player area, preview placeholder, Play button and timeline; typing
 
 ## Clean distribution
 
-`publish/` is a generated folder for transferring the ready converter. From a prepared development environment, build and verify it with:
+This repository contains the ready converter copied from the development workspace's `publish/` folder. Clone it or extract the downloaded ZIP, then run the launcher for your platform from that folder.
 
-```bash
-.venv/bin/python scripts/prepare_publish.py
-.venv/bin/python scripts/prepare_publish.py --check
-```
+The package includes runtime Python code, presets, OCIO/LUT resources, icons, launchers, the FFmpeg installer, user documentation, minimal Rust sources and a release **Linux** player. Tests, development scripts, benchmarks, old logs, caches and virtual environments are excluded. Detailed player tracing is off by default.
 
-On Windows, use `.venv\Scripts\python.exe` for both commands.
-
-The explicit file list includes runtime Python code, presets, OCIO/LUT resources, icons, launchers, FFmpeg installer, user documentation, minimal Rust sources and a release player for the build machine's OS/CPU. Tests, old logs, benchmarks, caches, Cargo build output and `.venv` are excluded. Detailed player tracing is off by default.
-
-Copy the **contents** of `publish/` to the destination folder and run its launcher. Dependencies are installed in a new local `.venv`; FFmpeg/ffprobe are still required. For another OS/CPU, build the native player there from the included Rust sources. `publish/` is generated locally and is not committed to the development repository. Regenerating it replaces its contents; make changes in the development sources first.
+Dependencies are installed into a new local `.venv`; FFmpeg/ffprobe are still required. Windows and macOS need their own native player build from the included Rust sources, as described above. The generated `publish/` folder itself is not nested inside this repository: its contents are placed directly at the repository root.
 
 ## Donate
 
