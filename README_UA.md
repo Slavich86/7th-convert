@@ -1,8 +1,4 @@
 <p align="center">
-  <img src="docs/images/social-preview.jpg" alt="7th VFX convertor" width="900">
-</p>
-
-<p align="center">
   <img src="https://img.shields.io/badge/Player-Rust-orange" alt="Rust player">
   <img src="https://img.shields.io/badge/Python-3.11%2B-blue" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/UI-Qt%206-green" alt="Qt 6">
