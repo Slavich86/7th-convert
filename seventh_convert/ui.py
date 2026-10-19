@@ -60,6 +60,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .display_color import MONITORS, display_preset, display_processor
 from .preview_controller import PreviewController
 from .command_builder import ConvertJob, build_ffmpeg_args, build_preview_frame_args, build_preview_proxy_args
 from .converter import format_command, output_exists_for_job, same_input_and_output, validate_job
@@ -2056,6 +2057,17 @@ class MainWindow(QMainWindow):
     def _build_player_panel(self) -> QWidget:
         panel = QWidget()
         layout = QVBoxLayout(panel)
+        monitor_row = QHBoxLayout()
+        monitor_row.addWidget(QLabel("Display"))
+        self.monitor_combo = QComboBox()
+        self.monitor_combo.setAccessibleName("Player monitor color space")
+        for label, value in MONITORS:
+            self.monitor_combo.addItem(label, value)
+        self._set_combo_data(self.monitor_combo, str(self.settings.value("player/monitor", "srgb")))
+        self.monitor_combo.currentIndexChanged.connect(self.handle_monitor_changed)
+        monitor_row.addWidget(self.monitor_combo)
+        monitor_row.addStretch(1)
+        layout.addLayout(monitor_row)
         self.preview_container = QWidget()
         self.preview_container.setAcceptDrops(True)
         self.preview_container.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -2350,14 +2362,6 @@ class MainWindow(QMainWindow):
         self.apply_selected_input(selected)
 
     def apply_selected_input(self, selected: SelectedInput) -> None:
-        previous_input_text = self.input_edit.text().strip()
-        previous_input_path = Path(previous_input_text).expanduser() if previous_input_text else None
-        previous_output_text = self.output_edit.text().strip() if hasattr(self, "output_edit") else ""
-        previous_output_transform = self.selected_output_transform()
-        previous_sequence_start = self.current_input_sequence_start
-        previous_sequence_end = self.current_input_sequence_end
-        previous_sequence_start_text = self.current_input_sequence_start_text
-        previous_sequence_end_text = self.current_input_sequence_end_text
         self.input_edit_refresh_timer.stop()
         self.input_edit.blockSignals(True)
         self.input_edit.setText(str(selected.input_path))
@@ -2384,27 +2388,8 @@ class MainWindow(QMainWindow):
             sequence_start_text=selected.sequence_start_text,
             sequence_end_text=selected.sequence_end_text,
         )
-        if not self.output_path_is_manual or not self.output_edit.text().strip():
-            self.output_edit.setText(next_output_path)
-        else:
-            followed_output_path = _manual_output_path_for_new_input(
-                current_output_text=previous_output_text,
-                previous_input_path=previous_input_path,
-                next_input_path=selected.input_path,
-                preset=self.current_preset(),
-                previous_output_transform=previous_output_transform,
-                next_output_transform=self.selected_output_transform(),
-                previous_sequence_start=previous_sequence_start,
-                previous_sequence_end=previous_sequence_end,
-                previous_sequence_start_text=previous_sequence_start_text,
-                previous_sequence_end_text=previous_sequence_end_text,
-                next_sequence_start=selected.sequence_start,
-                next_sequence_end=selected.sequence_end,
-                next_sequence_start_text=selected.sequence_start_text,
-                next_sequence_end_text=selected.sequence_end_text,
-            )
-            if followed_output_path is not None:
-                self.output_edit.setText(followed_output_path)
+        self.output_path_is_manual = False
+        self.output_edit.setText(next_output_path)
         self.refresh_fps_control_visibility()
         self.probe_input(selected.preview_path)
         self._remember_directory("last_video_input_dir", selected.input_path.parent)
@@ -2492,16 +2477,16 @@ class MainWindow(QMainWindow):
         self.refresh_frame_step_visibility()
         self.refresh_color_transform_defaults()
         self.refresh_fps_control_visibility()
-        if not self.output_path_is_manual or not self.output_edit.text().strip():
-            self.output_edit.setText(self._auto_output_path(
-                input_path,
-                self.current_preset(),
-                output_transform=self.selected_output_transform(),
-                sequence_start=sequence_start,
-                sequence_end=sequence_end,
-                sequence_start_text=sequence_start_text,
-                sequence_end_text=sequence_end_text,
-            ))
+        self.output_path_is_manual = False
+        self.output_edit.setText(self._auto_output_path(
+            input_path,
+            self.current_preset(),
+            output_transform=self.selected_output_transform(),
+            sequence_start=sequence_start,
+            sequence_end=sequence_end,
+            sequence_start_text=sequence_start_text,
+            sequence_end_text=sequence_end_text,
+        ))
         preview_path = frames[0] if frames else input_path
         if preview_path.exists():
             self._prepare_preview_source(preview_path, is_sequence=bool(frames))
@@ -2840,13 +2825,23 @@ class MainWindow(QMainWindow):
         self.refresh_scale_controls()
         self.refresh_media_info_summary()
 
+    def selected_monitor(self) -> str:
+        return str(self.monitor_combo.currentData() or "srgb")
+
+    def current_player_preset(self) -> Preset:
+        return display_preset(self.selected_input_transform(), self.selected_monitor(),
+                              self.active_ocio_config_path(), self.color_workflow != COLOR_WORKFLOW_NONE)
+
+    def handle_monitor_changed(self) -> None:
+        self.settings.setValue("player/monitor", self.selected_monitor())
+        self.refresh_preview_display_transform()
+
     def handle_output_transform_changed(self) -> None:
         self.refresh_output_path_extension()
         self.refresh_media_info_summary()
-        self.refresh_preview_display_transform()
 
     def handle_output_color_tags_changed(self) -> None:
-        self.refresh_preview_display_transform()
+        self.refresh_media_info_summary()
 
     def refresh_output_path_extension(self) -> None:
         if not hasattr(self, "output_edit"):
@@ -3008,6 +3003,9 @@ class MainWindow(QMainWindow):
 
     def refresh_color_transform_visibility(self) -> None:
         visible = self.color_workflow != COLOR_WORKFLOW_NONE
+        self.monitor_combo.setEnabled(visible)
+        self.monitor_combo.setToolTip("Player display only; export is independent." if visible else
+                                      "Enable Color Management in Preferences to use a monitor transform.")
         for widget in (
             self.input_transform_label,
             self.input_transform_combo,
@@ -3944,18 +3942,7 @@ class MainWindow(QMainWindow):
             return
         self._last_video_source_pixmap = QPixmap.fromImage(image)
         self.update_source_raster_size(self._last_video_source_pixmap.size())
-        if self.preview_is_raw_playback:
-            self.preview_placeholder.set_source_pixmap(
-                self._last_video_source_pixmap,
-                self.selected_pixel_aspect_for_path(self._current_preview_frame_path()),
-            )
-        elif self.preview_is_color_managed:
-            self.preview_placeholder.set_source_pixmap(
-                self._last_video_source_pixmap,
-                self.selected_pixel_aspect_for_path(self._current_preview_frame_path()),
-            )
-        else:
-            self._refresh_video_display_transform()
+        self._refresh_video_display_transform()
 
     def handle_player_position_changed(self, position_ms: int) -> None:
         self.position_slider.setValue(position_ms)
@@ -4080,7 +4067,7 @@ class MainWindow(QMainWindow):
             return
         self.sequence_frame_index = max(0, min(index, len(self.sequence_preview_frames) - 1))
         frame = self.sequence_preview_frames[self.sequence_frame_index]
-        preview_cache_key = self._preview_cache_key(frame, self.current_preset(), "frame")
+        preview_cache_key = self._preview_cache_key(frame, self.current_player_preset(), "frame")
         color_managed = self.color_preview_is_active() and not self.preview_is_raw_playback
         ram_preview_ready = (
             color_managed
@@ -4101,7 +4088,7 @@ class MainWindow(QMainWindow):
             return
         self.update_source_raster_size(pixmap.size())
         self._sync_auto_pixel_aspect_edit(frame)
-        if not self.preview_is_raw_playback and not ram_preview_ready:
+        if not ram_preview_ready:
             pixmap = self._display_pixmap_for_selected_input_transform(pixmap)
         self.preview_placeholder.set_source_pixmap(pixmap, self.selected_pixel_aspect_for_path(frame))
         self.position_slider.blockSignals(True)
@@ -4114,6 +4101,10 @@ class MainWindow(QMainWindow):
             self.rust_preview.refresh()
             return
         if self.preview_is_raw_playback:
+            if self.sequence_preview_frames:
+                self.show_sequence_frame(self.sequence_frame_index)
+            else:
+                self._refresh_video_display_transform()
             return
         if self.sequence_preview_frames:
             self.show_sequence_frame(self.sequence_frame_index)
@@ -4125,19 +4116,24 @@ class MainWindow(QMainWindow):
     def _refresh_video_display_transform(self) -> None:
         if self._last_video_source_pixmap.isNull():
             return
-        pixmap = _display_pixmap_for_input_transform(
-            self._last_video_source_pixmap,
-            self.selected_input_transform(),
-            self.active_ocio_config_path(),
-        )
+        pixmap = self._display_pixmap_for_selected_input_transform(self._last_video_source_pixmap)
         self.preview_placeholder.set_source_pixmap(pixmap, self.selected_pixel_aspect_for_path(self._current_preview_frame_path()))
 
     def _display_pixmap_for_selected_input_transform(self, pixmap: QPixmap) -> QPixmap:
-        return _display_pixmap_for_input_transform(
-            pixmap,
-            self.selected_input_transform(),
-            self.active_ocio_config_path(),
-        )
+        if pixmap.isNull() or self.color_workflow == COLOR_WORKFLOW_NONE:
+            return pixmap
+        try:
+            path = Path(self.active_ocio_config_path()).expanduser().resolve(strict=True)
+            processor = display_processor(str(path), path.stat().st_mtime_ns,
+                                          self.selected_input_transform(), self.selected_monitor())
+            if np is None:
+                raise ValueError("Player display transform requires NumPy")
+            image = pixmap.toImage().convertToFormat(QImage.Format.Format_RGBA8888)
+            return _ocio_display_pixmap_with_numpy(image, processor)
+        except Exception as exc:
+            self.record_error("Player display failed", str(exc))
+            self.preview_placeholder.setText(f"Player display failed: {exc}")
+            return QPixmap()
 
     def handle_media_status(self, status: QMediaPlayer.MediaStatus) -> None:
         if status == QMediaPlayer.MediaStatus.EndOfMedia:
@@ -4166,8 +4162,9 @@ class MainWindow(QMainWindow):
         self.progress_label.setText("Preview failed")
 
     def start_preview_proxy_generation(self, source_path: Path) -> None:
-        preset = self.current_preset()
-        cache_key = self._preview_cache_key(source_path, preset, "proxy")
+        # Keep proxy pixels in the source space so the monitor can change live.
+        preset = display_preset("", "", "", False)
+        cache_key = self._preview_cache_key(source_path, preset, "source_proxy")
         proxy_path = _preview_proxy_path(source_path, cache_key)
         self.preview_proxy_cache_key = cache_key
         self.preview_is_color_managed = False
@@ -4233,7 +4230,7 @@ class MainWindow(QMainWindow):
     def color_preview_is_active(self) -> bool:
         if self.color_workflow == COLOR_WORKFLOW_NONE:
             return False
-        return self.selected_input_transform() != self.selected_output_transform()
+        return bool(self.current_player_preset().filters)
 
     def _preview_cache_key(self, source_path: Path, preset: Preset, kind: str, position_ms: int | None = None) -> str:
         try:
@@ -4262,7 +4259,7 @@ class MainWindow(QMainWindow):
         if not self.preview_source_path or not self.preview_is_color_managed:
             return
         position_ms = self._current_position_ms()
-        cache_key = self._preview_cache_key(self.preview_source_path, self.current_preset(), "videoframe", position_ms=position_ms)
+        cache_key = self._preview_cache_key(self.preview_source_path, self.current_player_preset(), "videoframe", position_ms=position_ms)
         self._video_color_position_ms = position_ms
         if (
             self.preview_frame_cache_key == cache_key
@@ -4290,7 +4287,7 @@ class MainWindow(QMainWindow):
             worker.cancel()
             self.preview_frame_pending = (source_path, cache_key, position_ms)
             return
-        worker = PreviewFrameWorker(source_path, self.current_preset(), cache_key, position_ms)
+        worker = PreviewFrameWorker(source_path, self.current_player_preset(), cache_key, position_ms)
         worker.ready.connect(self.handle_preview_frame_ready)
         worker.failed.connect(self.handle_preview_frame_failed)
         worker.finished.connect(lambda worker=worker: self._handle_preview_frame_worker_finished(worker))
@@ -5267,48 +5264,6 @@ def _default_output_path(
     if preset.output.get("requires_pattern"):
         return str(input_path.with_name(f"{stem}.%04d.{extension}"))
     return str(input_path.with_name(f"{stem}.{extension}"))
-
-
-def _manual_output_path_for_new_input(
-    current_output_text: str,
-    previous_input_path: Path | None,
-    next_input_path: Path,
-    preset: Preset,
-    previous_output_transform: str | None = None,
-    next_output_transform: str | None = None,
-    previous_sequence_start: int | None = None,
-    previous_sequence_end: int | None = None,
-    previous_sequence_start_text: str | None = None,
-    previous_sequence_end_text: str | None = None,
-    next_sequence_start: int | None = None,
-    next_sequence_end: int | None = None,
-    next_sequence_start_text: str | None = None,
-    next_sequence_end_text: str | None = None,
-) -> str | None:
-    if not current_output_text or previous_input_path is None:
-        return None
-    current_output = Path(current_output_text).expanduser()
-    previous_default = Path(_default_output_path(
-        previous_input_path,
-        preset,
-        output_transform=previous_output_transform,
-        sequence_start=previous_sequence_start,
-        sequence_end=previous_sequence_end,
-        sequence_start_text=previous_sequence_start_text,
-        sequence_end_text=previous_sequence_end_text,
-    ))
-    if current_output.name != previous_default.name:
-        return None
-    next_default = Path(_default_output_path(
-        next_input_path,
-        preset,
-        output_transform=next_output_transform,
-        sequence_start=next_sequence_start,
-        sequence_end=next_sequence_end,
-        sequence_start_text=next_sequence_start_text,
-        sequence_end_text=next_sequence_end_text,
-    ))
-    return str(current_output.with_name(next_default.name))
 
 
 def _clean_sequence_stem(stem: str) -> str:

@@ -115,6 +115,8 @@ Actual codec availability depends on the installed FFmpeg build and hardware. EX
 
 Input and output transforms are separate. `Color Management: None` applies no OCIO LUT, FFmpeg color transform or forced output color metadata. Choose the bundled `Nuke Default OCIO` config or your own `config.ocio` for managed workflows, including ACES.
 
+The **Display** selector above the player offers **sRGB Monitor** and **Rec.709 Monitor**. Input Transform describes the source; the player converts it to the selected monitor space on pause, playback and seek. Output Transform affects export only. The monitor choice is saved independently and does not alter exported files. With Color Management set to None, Display is disabled and no display transform is applied. Custom OCIO configs must provide a corresponding sRGB/Rec.709 color space; a missing space is reported as a player error.
+
 Pixel aspect can be detected automatically (including EXR metadata) or set manually. `Keep Original Pixels` preserves the raster; `Resize to Square Pixels` adjusts it for square-pixel delivery. For example, a 2880 × 2160 source with PAR 2.0 displays at 5760 × 2160.
 
 Use embedded audio or `Audio Input` for an external file. `Add Audio Without Re-encoding Video` copies the MP4 video stream and encodes/muxes audio; resize, FPS and color controls are disabled in that mode.

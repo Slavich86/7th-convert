@@ -101,7 +101,7 @@ class PreviewController(QObject):
                 "path": str(w.preview_source_path.resolve()),
                 "files": [str(path.resolve()) for path in w.sequence_preview_frames],
                 "fps_num": fps.numerator, "fps_den": fps.denominator,
-                "filter": build_player_color_filter(w.current_preset()),
+                "filter": build_player_color_filter(w.current_player_preset()),
                 "max_width": min(8192, max(1, round(viewport.width() * ratio))),
                 "max_height": min(8192, max(1, round(viewport.height() * ratio))),
             }
